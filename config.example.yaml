@@ -1,0 +1,144 @@
+# clipper config example. Copy to $CLIPPER_HOME/config.yaml (default ~/.clipper/config.yaml)
+# or pass --config path. Every key is optional; these are the built-in defaults.
+# Regenerate with: uv run python scripts/gen_config_example.py
+#
+# Precedence (highest first): CLI flags and --set key=value, then $CLIPPER_HOME/settings.json
+# (written by the web UI / `clipper config import`), then this file, then built-in defaults.
+#
+# API keys never go here. Put ASSEMBLYAI_API_KEY and ANTHROPIC_API_KEY in .env.
+#
+# Notes:
+# - transcribe.speech_models is always sent explicitly (plural field).
+# - transcribe.speaker_labels: auto = on for podcast/interview or --speakers > 1.
+# - llm.*_effort replaces temperature: current Claude models reject custom sampling settings.
+# - llm budget per job = max(min_budget_usd, max_cost_usd_per_hour * source hours).
+# - llm.prices_per_mtok and transcribe.*price* drive cost logs and guards only.
+#   Verify them against the providers' pricing pages.
+# - selection.weights: speaker_energy has no signal until audio features land (M4);
+#   missing signals are skipped and the rest renormalized.
+# - captions.margin_v / hook.margin_v are pixels in a 1080x1920 frame.
+
+transcribe:
+  backend: assemblyai
+  speech_models:
+  - universal-3-5-pro
+  region: us
+  speaker_labels: auto
+  price_per_hour_usd: 0.21
+  diarization_price_per_hour_usd: 0.02
+  credit_usd: 50.0
+  credit_reserve_usd: 1.0
+  poll_interval_s: 5.0
+  timeout_s: 3600.0
+  fixture_path: null
+quality:
+  low_confidence_threshold: 0.5
+  max_low_confidence_share: 0.15
+  max_repetition_share: 0.05
+  repetition_ngram: 4
+  max_words_per_second: 6.5
+  block_on_fail: true
+llm:
+  backend: anthropic
+  candidate_model: claude-haiku-5-5
+  judge_model: claude-sonnet-5-5
+  candidate_effort: low
+  judge_effort: medium
+  candidate_prompt: candidates_v1
+  judge_prompt: judge_v1
+  max_tokens: 16000
+  judge_fallbacks: default
+  chunk_token_limit: 60000
+  chunk_overlap_tokens: 2000
+  candidate_multiplier: 3.0
+  context_seconds: 30.0
+  max_boundary_shift_sentences: 5
+  max_retries: 2
+  judge_concurrency: 4
+  max_cost_usd_per_hour: 0.75
+  min_budget_usd: 0.25
+  cache_responses: true
+  prices_per_mtok:
+    claude-haiku-5-5:
+    - 0.1
+    - 0.5
+    claude-sonnet-5-5:
+    - 2.0
+    - 10.0
+    claude-opus-5-5:
+    - 4.0
+    - 20.0
+selection:
+  max_clips: 8
+  min_duration: 20.0
+  max_duration: 60.0
+  extended_max_duration: 90.0
+  hard_cap_duration: 180.0
+  weights:
+    hook: 30
+    peak: 25
+    standalone_sense: 20
+    speaker_energy: 15
+    quotability: 10
+  gate_min: 6
+  min_editorial: 6.0
+  extended_bonus_required: 1.0
+  min_confidence: 0.6
+  dedupe_iou: 0.5
+  dedupe_shorter_overlap: 0.6
+  dedupe_text_jaccard: 0.6
+snap:
+  pre_roll_ms: 80
+  tail_ms: 150
+  search_ms: 150
+  frame_ms: 10
+  fade_ms: 25
+  leading_fillers:
+  - um
+  - uh
+  - erm
+  - hmm
+  - mm
+  - uhm
+  - ah
+  - eh
+render:
+  width: 1080
+  height: 1920
+  reframe: center
+  video_codec: libx264
+  preset: veryfast
+  crf: 20
+  audio_bitrate: 160k
+  threads: 0
+captions:
+  enabled: true
+  mode: word
+  font: Noto Sans
+  rtl_font: Noto Sans Arabic
+  fonts_dir: null
+  size: 80
+  bold: true
+  uppercase: false
+  primary_color: '#FFFFFF'
+  highlight_color: '#FFD400'
+  outline_color: '#000000'
+  outline: 6.0
+  shadow: 0.0
+  box: false
+  box_color: '#000000A0'
+  max_chars_per_line: 22
+  max_lines: 2
+  margin_v: 640
+  pop: true
+  max_page_gap_s: 0.6
+hook:
+  enabled: true
+  duration_s: 3.0
+  max_words: 8
+  size: 88
+  primary_color: '#FFFFFF'
+  box_color: '#000000'
+  box_padding: 14.0
+  margin_v: 320
+  max_chars_per_line: 18
