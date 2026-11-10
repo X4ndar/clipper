@@ -198,3 +198,32 @@ def test_jump_cut_clip_renders_the_pieces_back_to_back(tmp_path, sample_video):
     assert {s["codec_type"] for s in probe["streams"]} == {"video", "audio"}
     doc = json.loads((job.dir / c["files"]["captions_json"]).read_text(encoding="utf-8"))
     assert doc["words"][0]["word"].startswith("So") and doc["words"][0]["start"] < 0.5
+
+
+def test_stack_layout_renders_camera_over_gameplay(tmp_path, sample_video):
+    cfg = load_config(cli_overrides={**OVR, "render": {"reframe": "center", "layout": "stack"},
+                                     "reframe": {"facecam_region": "0.70,0.60,0.30,0.40"}}, home=tmp_path / "home")
+    db = DB(cfg.home_path / "clipper.db")
+    spec = JobSpec(video=str(sample_video), max_clips=1, min_duration=10, max_duration=40, rights_confirmed=True)
+    job = create_job(sample_video, spec, cfg, db)
+    run_job(job, cfg, db, progress=quiet)
+    c = job.read_json("clips.json")["clips"][0]
+    assert c["technical"]["framing"] == {"layout": "stack"} and c["technical"]["crop_ok"] is True
+    g = job.read_json("facecam.json")
+    assert g["top_h"] + g["bot_h"] == 1920 and g["cam"][0] + g["cam"][2] <= 1280
+    probe = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(job.dir / c["file"])],
+        capture_output=True, text=True, check=True).stdout)
+    v = next(s for s in probe["streams"] if s["codec_type"] == "video")
+    assert (v["width"], v["height"]) == (1080, 1920)
+    assert "camera on top" in job.path("report.html").read_text(encoding="utf-8")
+
+
+def test_signals_stage_and_direction(tmp_path, sample_video):
+    cfg, db, job = setup(tmp_path, sample_video, direction="only the hiring story")
+    run_job(job, cfg, db, stop_at="judge", progress=quiet)
+    sig = job.read_json("signals.json")
+    assert sig["seconds"] > 60 and len(sig["combined"]) == sig["seconds"] and not sig["has_chat"]
+    assert job.state["stats"]["selection_mode"] == "transcript"  # podcast content: peaks are not used
+    accepted = [r for r in job.read_json("judged.json")["records"] if r["status"] == "accepted"]
+    assert accepted and all("speaker_energy" in r["scores"] for r in accepted)

@@ -137,3 +137,40 @@ def test_cost_formula():
     assert cost_usd("claude-sonnet-5-5", {"input_tokens": 1_000_000, "output_tokens": 100_000},
                     LLMConfig().prices_per_mtok) == pytest.approx(3.0)
     assert cost_usd("unknown", {"input_tokens": 5}, {}) == 0.0
+
+
+def test_claude_code_backend_command_and_parsing(tmp_path, monkeypatch):
+    from clipper.llm import client as mod
+
+    seen = {}
+
+    def runner(cmd, stdin, cwd, env):
+        seen.update(cmd=cmd, stdin=stdin, env=env, system=open(cmd[cmd.index("--system-prompt-file") + 1]).read())
+        return 0, json.dumps({"is_error": False, "structured_output": GOOD_P1, "total_cost_usd": 0.01,
+                              "usage": {"input_tokens": 100, "output_tokens": 20, "iterations": []},
+                              "modelUsage": {"claude-haiku-5-5": {}}}), ""
+
+    monkeypatch.setattr("shutil.which", lambda name: "claude-bin")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-leak")
+    b = mod.ClaudeCodeBackend(runner=runner)
+    s = svc(tmp_path, b)
+    r = s.call(call(), "candidates")
+    cmd = seen["cmd"]
+    assert cmd[:2] == ["claude-bin", "-p"] and cmd[cmd.index("--tools") + 1] == ""
+    assert json.loads(cmd[cmd.index("--json-schema") + 1])["properties"]["candidates"]
+    assert seen["stdin"] == call().user and seen["system"] == call().system
+    assert "ANTHROPIC_API_KEY" not in seen["env"]
+    assert r.parsed.candidates[0].end_sentence_id == 9
+    assert r.cost_usd == 0 and r.usage["api_equivalent_cost_usd"] == 0.01 and r.model == "claude-haiku-5-5"
+
+
+def test_claude_code_backend_errors(tmp_path, monkeypatch):
+    from clipper.llm import client as mod
+
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(LLMError, match="not found"):
+        mod.ClaudeCodeBackend().complete(call())
+    monkeypatch.setattr("shutil.which", lambda name: "claude-bin")
+    b = mod.ClaudeCodeBackend(runner=lambda *a: (1, "", "Not logged in"))
+    with pytest.raises(LLMError, match="Not logged in"):
+        b.complete(call())

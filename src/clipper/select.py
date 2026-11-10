@@ -9,6 +9,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from .boundaries import Bounds, boundary_ok, compute_bounds
+from .config import EVENT_TYPES
 from .llm.client import BudgetExceeded, LLMCall, LLMError, LLMService, load_prompt
 from .llm.schemas import JudgeOutput, Pass1Output
 from .media import Wav
@@ -63,6 +64,54 @@ def clip_spans(r: ClipRecord) -> list[tuple[float, float, int, int]]:
     return [(r.start, r.end, r.w0, r.w1)]
 
 
+def resolve_prompt(name: str, kind: str, content_type: str) -> str:
+    """`auto` picks the prompt version by content type; anything else is used as given."""
+    if name != "auto":
+        return name
+    return f"{kind}_v2" if content_type in EVENT_TYPES else f"{kind}_v1"
+
+
+def selection_mode(cfg, content_type: str, duration_s: float, has_signals: bool) -> str:
+    mode = cfg.selection.mode
+    if mode == "auto":
+        if content_type in EVENT_TYPES and has_signals:
+            mode = "peaks" if duration_s > cfg.selection.peaks_only_over_s else "both"
+        else:
+            mode = "transcript"
+    if mode != "transcript" and not has_signals:
+        return "transcript"
+    return mode
+
+
+def _direction(spec: dict) -> str:
+    d = (spec.get("direction") or "").strip()
+    return f"Editor's direction (follow it when choosing and ranking): {d}\n" if d else ""
+
+
+def peak_candidates(tr: Transcript, sig: dict, spec: dict, cfg, start_index: int = 0) -> list[ClipRecord]:
+    """One candidate per audio/chat peak: the sentences from the build-up before it to the reaction
+    after it. The judge then fixes the exact boundaries."""
+    sc = cfg.signals
+    span = min(spec["max_duration"], sc.pre_s + sc.post_s)
+    pre = span * sc.pre_s / (sc.pre_s + sc.post_s)
+    out: list[ClipRecord] = []
+    for p in sig.get("peaks", []):
+        t0, t1 = p["t"] - pre, p["t"] + (span - pre)
+        ids = [s.id for s in tr.sentences if s.end > t0 and s.start < t1]
+        if len(ids) < 2:
+            continue  # nobody is talking around this peak; nothing to caption or judge
+        why = f"audio {p['audio_z']:.1f} sigma above the usual level"
+        if p.get("chat_z") is not None:
+            why += f", chat {p['chat_z']:.1f} sigma above its usual rate"
+        out.append(ClipRecord(
+            id=f"p{start_index + len(out) + 1:02d}", start_sentence_id=ids[0], end_sentence_id=ids[-1],
+            pass1={"source": "peaks", "peak_t": p["t"], "peak_score": p["score"],
+                   "reason": f"Signal peak at {fmt_ts(p['t'])} ({why}). The outcome or reaction is probably "
+                             "near that time; find the setup before it and end after the reaction."},
+        ))
+    return out
+
+
 def estimate_tokens(text: str) -> int:
     # Conservative: ~3.5 characters per token for English; other scripts are denser.
     return int(len(text) / 3.5) + 1
@@ -107,7 +156,8 @@ def generate_candidates(tr: Transcript, spec: dict, cfg, llm: LLMService) -> tup
     """Returns (valid candidate records, invalid raw candidates with reasons)."""
     sel, lc = cfg.selection, cfg.llm
     want = max(1, math.ceil(spec["max_clips"] * lc.candidate_multiplier))
-    system = load_prompt(lc.candidate_prompt)
+    prompt_name = resolve_prompt(lc.candidate_prompt, "candidates", spec["content_type"])
+    system = load_prompt(prompt_name)
     chunks = chunk_sentences(tr, lc.chunk_token_limit, lc.chunk_overlap_tokens)
     total_sents = len(tr.sentences)
     raw: list[tuple[int, Any]] = []
@@ -115,7 +165,8 @@ def generate_candidates(tr: Transcript, spec: dict, cfg, llm: LLMService) -> tup
         count = want if len(chunks) == 1 else max(2, math.ceil(want * len(sids) / total_sents) + 1)
         user = (
             f"Content type hint: {spec['content_type']}\n"
-            f"Language: {tr.language or 'unknown'}\n"
+            + _direction(spec)
+            + f"Language: {tr.language or 'unknown'}\n"
             f"Video duration: {fmt_ts(tr.duration)}\n"
             + (f"This is part {ci + 1} of {len(chunks)} of the transcript.\n" if len(chunks) > 1 else "")
             + f"Return up to {count} candidates. Target clip length: {spec['min_duration']:.0f}-"
@@ -123,7 +174,7 @@ def generate_candidates(tr: Transcript, spec: dict, cfg, llm: LLMService) -> tup
             f"needs two beats).\n\nTranscript:\n{sentence_lines(tr, sids)}"
         )
         call = LLMCall(
-            task="candidates", model=lc.candidate_model, prompt_version=lc.candidate_prompt, system=system,
+            task="candidates", model=lc.candidate_model, prompt_version=prompt_name, system=system,
             user=user, schema=Pass1Output, effort=lc.candidate_effort, max_tokens=lc.max_tokens,
             payload={"sentences": sentence_payload(tr, sids), "count": count,
                      "min_duration": spec["min_duration"], "max_duration": spec["max_duration"]},
@@ -175,14 +226,16 @@ def judge_one(tr: Transcript, rec: ClipRecord, spec: dict, cfg, llm: LLMService,
     user = (
         f"Content type hint: {spec['content_type']}. Target length {spec['min_duration']:.0f}-"
         f"{spec['max_duration']:.0f} s (hard max {sel.extended_max_duration:.0f} s).\n"
-        f"First-pass proposal: sentences {s0}-{s1} (about {t1 - t0:.0f} s). "
+        + _direction(spec)
+        +        f"First-pass proposal: sentences {s0}-{s1} (about {t1 - t0:.0f} s). "
         f"Reason given: {rec.pass1.get('reason', '')}\n\n"
         f"CONTEXT BEFORE:\n{sentence_lines(tr, before) or '(start of video)'}\n\n"
         f"CLIP:\n{sentence_lines(tr, clip)}\n\n"
         f"CONTEXT AFTER:\n{sentence_lines(tr, after) or '(end of video)'}"
     )
     call = LLMCall(
-        task="judge", model=lc.judge_model, prompt_version=lc.judge_prompt, system=system, user=user,
+        task="judge", model=lc.judge_model,
+        prompt_version=resolve_prompt(lc.judge_prompt, "judge", spec["content_type"]), system=system, user=user,
         schema=JudgeOutput, effort=lc.judge_effort, max_tokens=lc.max_tokens, fallbacks=lc.judge_fallbacks,
         payload={"clip_sentences": sentence_payload(tr, clip)},
     )
@@ -194,6 +247,8 @@ def judge_one(tr: Transcript, rec: ClipRecord, spec: dict, cfg, llm: LLMService,
     shown_lo = before[0] if before else s0
     shown_hi = after[-1] if after else s1
     m = lc.max_boundary_shift_sentences
+    if rec.pass1.get("source") == "peaks":
+        m = max(m, s1 - s0)  # a peak window is a rough guess: let the judge trim it freely
     ns0 = min(max(j.start_sentence_id, shown_lo, s0 - m), s0 + m)
     ns1 = min(max(j.end_sentence_id, s1 - m), shown_hi, s1 + m)
     if ns1 < ns0:
@@ -230,7 +285,7 @@ def judge_one(tr: Transcript, rec: ClipRecord, spec: dict, cfg, llm: LLMService,
 
 
 def judge_candidates(tr: Transcript, records: list[ClipRecord], spec: dict, cfg, llm: LLMService) -> list[ClipRecord]:
-    system = load_prompt(cfg.llm.judge_prompt)
+    system = load_prompt(resolve_prompt(cfg.llm.judge_prompt, "judge", spec["content_type"]))
     todo = [r for r in records if r.status == "pending"]
     budget_hit = False
 

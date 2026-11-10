@@ -120,6 +120,74 @@ class AnthropicBackend:
         return resp.parsed_output, usage, resp.stop_reason, getattr(resp, "model", call.model)
 
 
+class ClaudeCodeBackend:
+    """Runs each call through the Claude Code CLI (`claude -p`), which uses the Claude subscription
+    you are logged in with instead of an API key. No tools, no project settings, no saved session.
+
+    Calls count against the subscription's usage limits, not dollars: cost is logged as $0 and the
+    CLI's API-equivalent estimate is kept in the usage record.
+    """
+
+    name = "claude_code"
+    billed = False
+
+    def __init__(self, cfg=None, runner=None):
+        self.timeout_s = getattr(cfg, "claude_code_timeout_s", 600)
+        self.executable = getattr(cfg, "claude_code_path", None) or "claude"
+        self._run = runner or self._subprocess
+
+    def _subprocess(self, cmd: list[str], stdin: str, cwd: str, env: dict) -> tuple[int, str, str]:
+        import subprocess
+
+        try:
+            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", cwd=cwd, env=env, timeout=self.timeout_s)
+        except subprocess.TimeoutExpired as e:
+            raise LLMError(f"claude CLI timed out after {self.timeout_s}s") from e
+        return p.returncode, p.stdout, p.stderr
+
+    def complete(self, call: LLMCall) -> tuple[Optional[BaseModel], dict, Optional[str], str]:
+        import os
+        import shutil
+        import tempfile
+
+        exe = shutil.which(self.executable)
+        if not exe:
+            raise LLMError("the `claude` command was not found. Install Claude Code and log in with your "
+                           "subscription (run `claude`, then /login), or set llm.backend=anthropic.")
+        schema = json.dumps(call.schema.model_json_schema(), separators=(",", ":"))
+        if any(ch in schema for ch in "&|<>^%!"):
+            # On Windows the CLI is a .cmd shim; these characters do not survive cmd.exe quoting.
+            raise LLMError("schema contains characters that cannot be passed to the claude CLI")
+        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        with tempfile.TemporaryDirectory(prefix="clipper-llm-") as td:
+            sys_file = Path(td) / "system.md"
+            sys_file.write_text(call.system, encoding="utf-8")
+            cmd = [exe, "-p", "--model", call.model, "--effort", call.effort, "--output-format", "json",
+                   "--system-prompt-file", str(sys_file), "--json-schema", schema, "--tools", "",
+                   "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence"]
+            code, out, err = self._run(cmd, call.user, td, env)
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            tail = (err or out).strip()[-400:]
+            raise LLMError(f"claude CLI failed (exit {code}): {tail or 'no output'}. If you are not logged in, "
+                           "run `claude` and use /login.") from None
+        if data.get("is_error") or code != 0:
+            raise LLMError(f"claude CLI error: {str(data.get('result') or data.get('subtype'))[:400]}")
+        usage = dict(data.get("usage") or {})
+        usage = {k: v for k, v in usage.items() if isinstance(v, (int, float, str))}
+        usage["api_equivalent_cost_usd"] = data.get("total_cost_usd")
+        # modelUsage also lists a small helper model the CLI uses; report the one that wrote the answer.
+        mu = data.get("modelUsage") or {}
+        model_used = call.model if call.model in mu or not mu else max(mu, key=lambda k: mu[k].get("outputTokens", 0))
+        out_obj = data.get("structured_output")
+        if out_obj is None:  # older CLI: JSON in the text result
+            out_obj = json.loads(data.get("result") or "null")
+        parsed = call.schema.model_validate(out_obj) if out_obj is not None else None
+        return parsed, usage, "end_turn", model_used
+
+
 class FakeBackend:
     """Deterministic, offline stand-in for tests and dry runs. Not a quality signal."""
 
@@ -270,7 +338,7 @@ class LLMService:
                 secs = time.monotonic() - t0
                 # A refusal fallback bills at the serving model's rates.
                 priced = model_used if model_used in self.cfg.prices_per_mtok else call.model
-                cost = cost_usd(priced, usage, self.cfg.prices_per_mtok)
+                cost = cost_usd(priced, usage, self.cfg.prices_per_mtok) if getattr(self.backend, "billed", True) else 0.0
                 if parsed is None:
                     raise LLMError(f"no parsable output (stop_reason={stop})")
                 with self._lock:
@@ -301,6 +369,8 @@ class LLMService:
 def get_backend(cfg):
     if cfg.backend == "anthropic":
         return AnthropicBackend()
+    if cfg.backend == "claude_code":
+        return ClaudeCodeBackend(cfg)
     if cfg.backend == "fake":
         return FakeBackend()
     raise ValueError(f"unknown llm backend {cfg.backend!r}")

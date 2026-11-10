@@ -60,6 +60,25 @@ class DynamicCrop:
     cmd_path: Path
 
 
+@dataclass
+class StackLayout:
+    """Streamer camera on top, gameplay below. Boxes are [x, y, w, h] in source pixels."""
+
+    cam: list[int]
+    game: list[int]
+    top_h: int
+    bot_h: int
+
+
+def stack_filter(s: StackLayout, width: int) -> str:
+    cx, cy, cw, ch = s.cam
+    gx, gy, gw, gh = s.game
+    return (
+        f"split[fc_a][fc_b];[fc_a]crop={cw}:{ch}:{cx}:{cy},scale={width}:{s.top_h}:flags=lanczos[fc_t];"
+        f"[fc_b]crop={gw}:{gh}:{gx}:{gy},scale={width}:{s.bot_h}:flags=lanczos[fc_g];[fc_t][fc_g]vstack,setsar=1"
+    )
+
+
 def crop_filter(width: int, height: int) -> str:
     # Center crop to the target aspect, then scale. Works for landscape, square and portrait input.
     ar = f"{width}/{height}"
@@ -77,8 +96,14 @@ def dynamic_crop_filter(c: DynamicCrop, width: int, height: int) -> str:
 
 
 def video_filter(rcfg, ass_path: Optional[Path], fonts_dir: Optional[Path],
-                 crop: Optional[DynamicCrop] = None) -> str:
-    vf = crop_filter(rcfg.width, rcfg.height) if crop is None else dynamic_crop_filter(crop, rcfg.width, rcfg.height)
+                 crop=None) -> str:
+    """`crop` is None (center crop), a DynamicCrop (moving crop) or a StackLayout."""
+    if isinstance(crop, StackLayout):
+        vf = stack_filter(crop, rcfg.width)
+    elif crop is None:
+        vf = crop_filter(rcfg.width, rcfg.height)
+    else:
+        vf = dynamic_crop_filter(crop, rcfg.width, rcfg.height)
     if ass_path is not None:
         vf += f",ass='{_filter_path(ass_path)}'"
         if fonts_dir is not None:

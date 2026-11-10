@@ -54,9 +54,10 @@ review report, eval harness (gold format, label sheet, precision@k, run log), AG
 M2 (this delivery, basic): word-highlight ASS captions burned in, hook overlay, editable captions
 JSON + re-render, single-frame style preview, RTL font.
 M3: reframing. Done: sampled face detection (MediaPipe full-range, CPU), shot-cut detection, a
-hold-still / smooth-pan crop path per shot, framing metrics vs center crop. Next: active speaker
-(mouth motion against speech, plus diarization labels when on), then two-person layouts.
-M4: audio signals, visual check, pairwise ranking, A/B, batch mode, job history UI.
+hold-still / smooth-pan crop path per shot, framing metrics vs center crop. mouth-movement speaker pick, camera-over-gameplay
+stack layout for streams. Next: measure the speaker pick (or move to LR-ASD, MIT), two-person layouts.
+M4 (started): audio loudness and chat-rate signals, peak-first selection for streams, `--direction`,
+prompts chosen by content type. Remaining: visual check, pairwise ranking, A/B, batch mode, job history UI.
 M5: YouTube upload (private, human approval), then performance loop.
 M6: FastAPI + web UI + SSE progress, API keys, MCP server, SKILL.md, packaging.
 

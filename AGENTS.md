@@ -20,11 +20,13 @@ src/clipper/
   media.py        ffprobe/ffmpeg helpers, hashing, WAV RMS access
   transcript.py   Word/Sentence/Transcript, segmentation, quality check, SRT
   transcribe/     Transcriber backends: assemblyai (REST via httpx), fixture (JSON on disk)
-  llm/            client.py (Anthropic + fake backends, cache, run log, budget), schemas.py,
+  llm/            client.py (Anthropic API, Claude Code CLI (subscription) and fake backends, cache, run log, budget), schemas.py,
                   prompts/<name>_vN.md (versioned; never edit a version in place, add v2)
-  select.py       pass 1, pass 2, hard gates, weights, dedupe, final pick
+  signals.py      audio loudness + chat-rate z-scores, peaks (signals.json), chat file parsers
+  select.py       peak candidates, selection mode, prompt auto-choice, pass 1, pass 2, hard gates, weights, dedupe, final pick
   boundaries.py   sentence->word mapping, clause offsets, filler drop, quiet-frame snapping
-  reframe.py      shot cuts, MediaPipe face detection, crop path (sendcmd), framing metrics
+  reframe.py      shot cuts, MediaPipe face detection, mouth-movement speaker pick, crop path (sendcmd),
+                  facecam detection + stack geometry, framing metrics
   captions.py     ASS generation (word highlight, karaoke, plain) + hook overlay
   render.py       ffmpeg cut/crop (fixed or moving)/burn-in, single-frame preview, font folder merge
   report.py       report.html

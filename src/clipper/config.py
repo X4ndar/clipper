@@ -20,7 +20,9 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
-ContentType = Literal["podcast", "interview", "talking_head", "tutorial", "other"]
+ContentType = Literal["podcast", "interview", "talking_head", "tutorial", "stream", "challenge", "other"]
+# Fast, visual videos where the unit is a moment (setup, attempt, outcome, reaction), not an idea.
+EVENT_TYPES = ("stream", "challenge")
 
 
 class TranscribeConfig(BaseModel):
@@ -51,14 +53,19 @@ class QualityConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    backend: Literal["anthropic", "fake"] = "anthropic"
+    # anthropic: API key (pay per token). claude_code: your Claude subscription, through the
+    # Claude Code CLI (`claude` must be installed and logged in). fake: offline keyword heuristics.
+    backend: Literal["anthropic", "claude_code", "fake"] = "anthropic"
+    claude_code_path: Optional[str] = None  # default: `claude` on PATH
+    claude_code_timeout_s: int = 600
     candidate_model: str = "claude-haiku-5-5"
     judge_model: str = "claude-sonnet-5-5"
     # Current models reject custom temperature; effort is the lever instead.
     candidate_effort: Literal["low", "medium", "high"] = "low"
     judge_effort: Literal["low", "medium", "high"] = "medium"
-    candidate_prompt: str = "candidates_v1"
-    judge_prompt: str = "judge_v1"
+    # auto: candidates_v2 / judge_v2 for stream and challenge videos, v1 otherwise.
+    candidate_prompt: str = "auto"
+    judge_prompt: str = "auto"
     max_tokens: int = 16000
     # Server-side refusal fallback for the judge model ("default" or null to disable).
     judge_fallbacks: Optional[Literal["default"]] = "default"
@@ -83,7 +90,31 @@ class LLMConfig(BaseModel):
     )
 
 
+class SignalsConfig(BaseModel):
+    enabled: bool = True
+    audio_window_s: float = 120.0  # rolling baseline for loudness
+    chat_window_s: float = 600.0  # rolling baseline for chat rate
+    chat_smooth_s: float = 9.0
+    chat_lag_s: float = 5.0  # viewers type after the moment; shift chat this much earlier
+    audio_weight: float = 1.0
+    chat_weight: float = 1.0
+    hype_bonus: float = 0.5  # extra weight for messages with emotes or hype words
+    hype_words: list[str] = Field(default_factory=lambda: [
+        "lul", "lol", "lmao", "kekw", "omegalul", "pog", "omg", "wtf", "clip", "no way", "???", "!!!", "gg",
+        "holy", "insane", "hahaha", "xd", "rip",
+    ])
+    threshold: float = 1.0  # combined z-score a peak must reach (the strongest peaks win)
+    min_gap_s: float = 45.0  # minimum distance between two peaks
+    pre_s: float = 40.0  # a peak's candidate window starts this long before it (the build-up)
+    post_s: float = 15.0  # and ends this long after it (the reaction)
+
+
 class SelectionConfig(BaseModel):
+    # Where candidates come from. transcript: LLM pass 1. peaks: audio/chat peaks only (no pass 1).
+    # both: the two together. auto: stream/challenge videos use both, or peaks alone when longer than
+    # `peaks_only_over_s`; everything else uses transcript.
+    mode: Literal["auto", "transcript", "peaks", "both"] = "auto"
+    peaks_only_over_s: float = 2700.0
     max_clips: int = 8
     min_duration: float = 20.0
     max_duration: float = 60.0
@@ -123,6 +154,9 @@ class RenderConfig(BaseModel):
     height: int = 1920
     # face: follow faces (needs the `reframe` extra; falls back to center with a warning). center: fixed crop.
     reframe: Literal["face", "center"] = "face"
+    # single: one crop. stack: streamer camera on top, gameplay below. auto: stack for stream videos
+    # when a camera overlay is found, single otherwise.
+    layout: Literal["auto", "single", "stack"] = "auto"
     video_codec: str = "libx264"
     preset: str = "veryfast"
     crf: int = 20
@@ -139,6 +173,10 @@ class ReframeConfig(BaseModel):
     smooth_s: float = 1.0  # pan smoothing window
     cut_threshold: float = 0.12  # mean frame difference that marks a shot cut
     min_face_in_frame: float = 0.8  # below this share of frames, flag the clip for review
+    follow_speaker: bool = True  # when not everyone fits, prefer the face whose mouth is moving
+    stack_top_share: float = 0.34  # share of the frame height given to the camera in the stack layout
+    # Camera overlay as "x,y,w,h" in 0-1 of the source frame, e.g. "0.75,0.70,0.25,0.30". Default: detect.
+    facecam_region: Optional[str] = None
     model_url: str = (
         "https://storage.googleapis.com/mediapipe-models/face_detector/"
         "blaze_face_full_range/float16/1/blaze_face_full_range.tflite"
@@ -184,12 +222,24 @@ class HookConfig(BaseModel):
     max_chars_per_line: int = 18
 
 
+class FetchConfig(BaseModel):
+    """Downloading a finished stream from a link (needs the `fetch` extra: yt-dlp)."""
+
+    max_height: int = 1080  # highest video resolution to download
+    chat: bool = True  # also fetch the chat replay when the platform has one
+    chat_threads: int = 4  # parallel requests for the chat replay
+    fragment_threads: int = 4  # parallel video fragment downloads
+    dir: Optional[str] = None  # default: $CLIPPER_HOME/downloads
+
+
 class Config(BaseModel):
     home: str = ""
+    fetch: FetchConfig = Field(default_factory=FetchConfig)
     transcribe: TranscribeConfig = Field(default_factory=TranscribeConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
+    signals: SignalsConfig = Field(default_factory=SignalsConfig)
     snap: SnapConfig = Field(default_factory=SnapConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
     reframe: ReframeConfig = Field(default_factory=ReframeConfig)

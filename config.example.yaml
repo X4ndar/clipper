@@ -18,6 +18,12 @@
 #   missing signals are skipped and the rest renormalized.
 # - captions.margin_v / hook.margin_v are pixels in a 1080x1920 frame.
 
+fetch:
+  max_height: 1080
+  chat: true
+  chat_threads: 4
+  fragment_threads: 4
+  dir: null
 transcribe:
   backend: assemblyai
   speech_models:
@@ -40,12 +46,14 @@ quality:
   block_on_fail: true
 llm:
   backend: anthropic
+  claude_code_path: null
+  claude_code_timeout_s: 600
   candidate_model: claude-haiku-5-5
   judge_model: claude-sonnet-5-5
   candidate_effort: low
   judge_effort: medium
-  candidate_prompt: candidates_v1
-  judge_prompt: judge_v1
+  candidate_prompt: auto
+  judge_prompt: auto
   max_tokens: 16000
   judge_fallbacks: default
   chunk_token_limit: 60000
@@ -69,6 +77,8 @@ llm:
     - 4.0
     - 20.0
 selection:
+  mode: auto
+  peaks_only_over_s: 2700.0
   max_clips: 8
   min_duration: 20.0
   max_duration: 60.0
@@ -87,6 +97,38 @@ selection:
   dedupe_iou: 0.5
   dedupe_shorter_overlap: 0.6
   dedupe_text_jaccard: 0.6
+signals:
+  enabled: true
+  audio_window_s: 120.0
+  chat_window_s: 600.0
+  chat_smooth_s: 9.0
+  chat_lag_s: 5.0
+  audio_weight: 1.0
+  chat_weight: 1.0
+  hype_bonus: 0.5
+  hype_words:
+  - lul
+  - lol
+  - lmao
+  - kekw
+  - omegalul
+  - pog
+  - omg
+  - wtf
+  - clip
+  - no way
+  - ???
+  - '!!!'
+  - gg
+  - holy
+  - insane
+  - hahaha
+  - xd
+  - rip
+  threshold: 1.0
+  min_gap_s: 45.0
+  pre_s: 40.0
+  post_s: 15.0
 snap:
   pre_roll_ms: 80
   tail_ms: 150
@@ -106,6 +148,7 @@ render:
   width: 1080
   height: 1920
   reframe: face
+  layout: auto
   video_codec: libx264
   preset: veryfast
   crf: 20
@@ -120,6 +163,9 @@ reframe:
   smooth_s: 1.0
   cut_threshold: 0.12
   min_face_in_frame: 0.8
+  follow_speaker: true
+  stack_top_share: 0.34
+  facecam_region: null
   model_url: https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite
   model_sha256: 3698b18f063835bc609069ef052228fbe86d9c9a6dc8dcb7c7c2d69aed2b181b
   model_path: null

@@ -37,6 +37,9 @@ class Face:
     w: float
     h: float
     score: float
+    mx: Optional[float] = None  # mouth keypoint, when the detector gives one
+    my: Optional[float] = None
+    mouth: float = 0.0  # mouth movement since the previous sample (0 = still); see mouth_activity()
 
     @property
     def left(self) -> float:
@@ -163,10 +166,49 @@ def sample_faces(src: Path, start: float, dur: float, fps: float, detector: Face
            "-t", f"{dur:.3f}", "-an", "-vf", f"fps={fps},scale={w}:{h}",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     times, faces = [], []
+    prev: list[tuple[Face, np.ndarray, np.ndarray]] = []
     for k, frame in enumerate(_read_frames(cmd, w, h, 3)):
         times.append(round(k / fps, 3))
-        faces.append(detector.detect(frame))
+        found = detector.detect(frame)
+        prev = mouth_activity(frame, found, prev)
+        faces.append(found)
     return times, faces
+
+
+def _patch(gray: np.ndarray, cx: float, cy: float, half_w: float, half_h: float) -> np.ndarray:
+    H, W = gray.shape
+    x0, x1 = int(max(0, (cx - half_w) * W)), int(min(W, (cx + half_w) * W))
+    y0, y1 = int(max(0, (cy - half_h) * H)), int(min(H, (cy + half_h) * H))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return np.zeros((8, 8), np.float32)
+    p = gray[y0:y1, x0:x1]
+    ys = np.linspace(0, p.shape[0] - 1, 8).astype(int)
+    xs = np.linspace(0, p.shape[1] - 1, 8).astype(int)
+    return p[np.ix_(ys, xs)].astype(np.float32) / 255.0
+
+
+def mouth_activity(frame: np.ndarray, faces: list[Face], prev: list) -> list:
+    """Set Face.mouth: how much the mouth area changed since the same face in the previous sample,
+    minus how much the eye area changed (which cancels head and camera movement). A cheap stand-in
+    for an active-speaker model. Returns the state to pass in with the next frame."""
+    gray = frame.mean(axis=2) if frame.ndim == 3 else frame
+    state = []
+    for f in faces:
+        mx = f.mx if f.mx is not None else f.cx
+        my = f.my if f.my is not None else f.cy + 0.22 * f.h
+        mouth = _patch(gray, mx, my, 0.22 * f.w, 0.14 * f.h)
+        eyes = _patch(gray, f.cx, f.cy - 0.15 * f.h, 0.30 * f.w, 0.12 * f.h)
+        best = None
+        for pf, pm, pe in prev:
+            d = abs(pf.cx - f.cx) + abs(pf.cy - f.cy)
+            if d < 0.6 * f.w and 0.7 < pf.w / f.w < 1.4 and (best is None or d < best[0]):
+                best = (d, pf, pm, pe)
+        if best is not None:
+            _, pf, pm, pe = best
+            raw = max(0.0, float(np.abs(mouth - pm).mean()) - float(np.abs(eyes - pe).mean()))
+            f.mouth = round(0.6 * raw + 0.4 * pf.mouth, 4)
+        state.append((f, mouth, eyes))
+    return state
 
 
 # ---------------- path planning ----------------
@@ -180,7 +222,8 @@ def main_faces(faces: list[Face], min_rel_size: float) -> list[Face]:
     return [f for f in faces if f.w >= min_rel_size * big]
 
 
-def target_center(faces: list[Face], crop_frac: float, prev: Optional[float]) -> Optional[float]:
+def target_center(faces: list[Face], crop_frac: float, prev: Optional[float],
+                  follow_speaker: bool = False) -> Optional[float]:
     """Where the crop center should be (0..1 of source width) for one sample, or None if no face."""
     if not faces:
         return None
@@ -190,6 +233,11 @@ def target_center(faces: list[Face], crop_frac: float, prev: Optional[float]) ->
     # Not everyone fits: the largest face. Near-ties go to the one we are already on, or at the start
     # of a shot to the one nearest the middle (where the camera operator put the subject).
     big = max(f.w for f in faces)
+    if follow_speaker:
+        # The face whose mouth is clearly moving more than anyone else's is the one talking.
+        cand = sorted((f for f in faces if f.w >= 0.6 * big), key=lambda f: -f.mouth)
+        if cand[0].mouth >= 0.02 and (len(cand) == 1 or cand[0].mouth >= 1.5 * cand[1].mouth):
+            return cand[0].cx
     near = [f for f in faces if f.w >= 0.8 * big]
     anchor = prev if prev is not None else 0.5
     return min(near, key=lambda f: abs(f.cx - anchor)).cx
@@ -252,7 +300,7 @@ def plan_path(times: list[float], faces: list[list[Face]], cuts: list[float], sr
         prev: Optional[float] = None  # a new shot is a new composition: no carry-over
         targets = []
         for i in idx:
-            tc = target_center(kept[i], crop_frac, prev)
+            tc = target_center(kept[i], crop_frac, prev, getattr(rcfg, "follow_speaker", False))
             if tc is not None:
                 prev = tc
             targets.append(tc)
@@ -322,6 +370,59 @@ def concat_plans(plans: list[CropPlan], durations: list[float]) -> CropPlan:
     out.metrics = {"samples": n, "shots": shots, "face_share": round(with_face / n, 3) if n else 0.0,
                    **{k: (round(v / with_face, 3) if with_face else None) for k, v in acc.items()}}
     return out
+
+
+# ---------------- facecam + gameplay ----------------
+
+
+def detect_facecam(samples: list[list[Face]], min_share: float = 0.6, max_width: float = 0.22
+                   ) -> Optional[tuple[float, float, float]]:
+    """A streamer's camera overlay: a smallish face that sits in the same place in most samples, even
+    across shot cuts. Returns its (cx, cy, face_width), normalized, or None."""
+    samples = [s for s in samples if s is not None]
+    faces = [f for s in samples for f in s if f.w <= max_width]
+    if len(samples) < 8 or not faces:
+        return None
+    best, best_n = None, 0
+    for f in faces[:: max(1, len(faces) // 200)]:
+        n = sum(any(abs(g.cx - f.cx) < 0.03 and abs(g.cy - f.cy) < 0.04 and 0.7 < g.w / f.w < 1.4 for g in s)
+                for s in samples)
+        if n > best_n:
+            best, best_n = f, n
+    if best is None or best_n / len(samples) < min_share:
+        return None
+    close = [g for s in samples for g in s if abs(g.cx - best.cx) < 0.03 and abs(g.cy - best.cy) < 0.04]
+    return (float(np.median([g.cx for g in close])), float(np.median([g.cy for g in close])),
+            float(np.median([g.w for g in close])))
+
+
+def stack_geometry(src_w: int, src_h: int, out_w: int, out_h: int, top_share: float,
+                   cam: tuple[float, float, float, float]) -> dict:
+    """Pixel boxes for the stacked layout: camera on top, gameplay below. `cam` is the camera region
+    (x, y, w, h, normalized); it is grown to the top panel's aspect ratio and kept inside the frame."""
+    top_h = int(out_h * top_share) // 2 * 2
+    bot_h = out_h - top_h
+    def fit(cx: float, cy: float, w: float, h: float, aspect: float) -> list[int]:
+        w, h = max(w, h * aspect), max(h, w / aspect)
+        if w > src_w:
+            w, h = src_w, src_w / aspect
+        if h > src_h:
+            w, h = src_h * aspect, src_h
+        x = min(max(cx - w / 2, 0), src_w - w)
+        y = min(max(cy - h / 2, 0), src_h - h)
+        return [int(x) // 2 * 2, int(y) // 2 * 2, int(w) // 2 * 2, int(h) // 2 * 2]
+    x, y, w, h = cam
+    cam_box = fit((x + w / 2) * src_w, (y + h / 2) * src_h, w * src_w, h * src_h, out_w / top_h)
+    game_box = fit(src_w / 2, src_h / 2, 1, src_h, out_w / bot_h)
+    return {"cam": cam_box, "game": game_box, "top_h": top_h, "bot_h": bot_h}
+
+
+def facecam_region(face: tuple[float, float, float], src_w: int, src_h: int) -> tuple[float, float, float, float]:
+    """A camera box around a detected facecam face: about three face-widths wide, head near the top third."""
+    cx, cy, fw = face
+    w = min(1.0, 3.2 * fw)
+    h = min(1.0, w * src_w / src_h * 0.6)
+    return (min(max(cx - w / 2, 0.0), 1.0 - w), min(max(cy - 0.42 * h, 0.0), 1.0 - h), w, h)
 
 
 # ---------------- ffmpeg commands ----------------
@@ -404,8 +505,12 @@ class MediaPipeFaces:
         for d in self._det.detect(img).detections:
             b = d.bounding_box
             score = d.categories[0].score if d.categories else 0.0
+            kp = getattr(d, "keypoints", None) or []
+            mouth = kp[3] if len(kp) > 3 else None  # BlazeFace order: eyes, nose, mouth, ears
             out.append(Face(cx=(b.origin_x + b.width / 2) / w, cy=(b.origin_y + b.height / 2) / h,
-                            w=b.width / w, h=b.height / h, score=float(score)))
+                            w=b.width / w, h=b.height / h, score=float(score),
+                            mx=None if mouth is None else float(mouth.x),
+                            my=None if mouth is None else float(mouth.y)))
         return out
 
 
@@ -419,7 +524,7 @@ def get_detector(rcfg, home: Path) -> FaceDetector:
 def reframe_clip(src: Path, start: float, end: float, src_w: int, src_h: int, src_fps: float,
                  out_w: int, out_h: int, rcfg, detector: FaceDetector, faces_cache: Optional[Path] = None) -> CropPlan:
     dur = max(0.1, end - start)
-    key = {"start": round(start, 3), "end": round(end, 3), "sample_fps": rcfg.sample_fps,
+    key = {"v": 2, "start": round(start, 3), "end": round(end, 3), "sample_fps": rcfg.sample_fps,
            "detector": detector.name, "min_confidence": rcfg.min_confidence, "max_width": rcfg.analysis_width,
            "cut_threshold": rcfg.cut_threshold}
     cached = None

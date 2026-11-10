@@ -62,6 +62,8 @@ def _framing(m: Optional[dict]) -> str:
     """One line on the face-following crop: how often a face is fully visible, vs a plain center crop."""
     if not m:
         return ""
+    if m.get("layout") == "stack":
+        return "<div class='muted'>framing: streamer camera on top, gameplay below</div>"
     if m.get("face_in_frame") is None:
         return "<div class='muted'>framing: no faces found; crop holds the center</div>"
 
@@ -113,6 +115,7 @@ def write_report(job: Job, cfg) -> Path:
         f"<h1>Clip review</h1><div class='muted'>{e(Path(spec.get('video', '')).name)} · job <code>{e(job.id)}</code>"
         f" · {e(spec.get('content_type'))} · "
         + (f"selection: <b>{e(job.state['selection_source'])}</b>" if job.state.get("selection_source") else
+           f"selection {e(st.get('selection_mode') or 'transcript')} · "
            f"prompts {e(cfg.llm.candidate_prompt)}/{e(cfg.llm.judge_prompt)}"
            f" · models {e(cfg.llm.candidate_model)}/{e(cfg.llm.judge_model)}")
         + "</div>",

@@ -119,3 +119,50 @@ def test_joined_plans_cut_at_the_join_and_weight_metrics():
     assert 4.0 in j.shot_starts and j.metrics["shots"] == 2 and j.metrics["samples"] == len(t1) + len(t2)
     assert j.x_at(3.9) == pytest.approx(p1.x_at(3.9)) and j.x_at(4.0) == pytest.approx(p2.x_at(0.0))
     assert j.metrics["face_in_frame"] == 1.0
+
+
+def test_facecam_is_a_small_face_that_never_moves():
+    from clipper.reframe import detect_facecam, facecam_region, stack_geometry
+
+    rng = np.random.default_rng(3)
+    samples = []
+    for k in range(80):
+        fs = [face(float(rng.uniform(0.2, 0.7)), w=0.05)] if k % 3 == 0 else []  # people in the gameplay
+        if k % 10:  # the camera overlay, missed by the detector now and then
+            fs.append(Face(cx=0.88 + float(rng.normal(0, 0.003)), cy=0.80, w=0.07, h=0.12, score=0.9))
+        samples.append(fs)
+    cam = detect_facecam(samples)
+    assert cam is not None and cam[0] == pytest.approx(0.88, abs=0.01) and cam[2] == pytest.approx(0.07)
+    assert detect_facecam([[face(float(rng.uniform(0.1, 0.9)))] for _ in range(80)]) is None  # moving faces
+    assert detect_facecam([[face(0.5, w=0.4)] for _ in range(80)]) is None  # a full-frame talking head
+    x, y, w, h = facecam_region(cam, W, H)
+    assert x + w <= 1.0 and y + h <= 1.0 and x < 0.88 < x + w
+    g = stack_geometry(W, H, 1080, 1920, 0.34, (x, y, w, h))
+    assert g["top_h"] + g["bot_h"] == 1920
+    cx, cy, cw, ch = g["cam"]
+    assert cx + cw <= W and cy + ch <= H and cw / ch == pytest.approx(1080 / g["top_h"], rel=0.03)
+    gx, gy, gw, gh = g["game"]
+    assert gh == H and gw / gh == pytest.approx(1080 / g["bot_h"], rel=0.03) and gx + gw / 2 == pytest.approx(W / 2, abs=2)
+
+
+def test_mouth_movement_marks_the_speaker():
+    from clipper.reframe import mouth_activity
+
+    rng = np.random.default_rng(4)
+    base = rng.integers(60, 200, (360, 640, 3)).astype(np.uint8)
+    a, b = Face(cx=0.25, cy=0.4, w=0.12, h=0.2, score=0.9), Face(cx=0.75, cy=0.4, w=0.12, h=0.2, score=0.9)
+    state = mouth_activity(base, [a, b], [])
+    for _ in range(4):
+        frame = base.copy()
+        # only the left face's mouth area changes
+        y0, y1, x0, x1 = int(0.41 * 360), int(0.47 * 360), int(0.225 * 640), int(0.275 * 640)
+        frame[y0:y1, x0:x1] = rng.integers(0, 255, (y1 - y0, x1 - x0, 3))
+        a, b = Face(cx=0.25, cy=0.4, w=0.12, h=0.2, score=0.9), Face(cx=0.75, cy=0.4, w=0.12, h=0.2, score=0.9)
+        state = mouth_activity(frame, [a, b], state)
+    assert a.mouth > 0.02 and b.mouth == 0
+    crop_frac = 404 / W
+    far = [Face(cx=0.2, cy=0.4, w=0.10, h=0.2, score=0.9, mouth=0.0), Face(cx=0.8, cy=0.4, w=0.09, h=0.2, score=0.9, mouth=0.08)]
+    assert target_center(far, crop_frac, prev=0.2, follow_speaker=True) == pytest.approx(0.8)  # goes to the talker
+    assert target_center(far, crop_frac, prev=0.2, follow_speaker=False) == pytest.approx(0.2)
+    far[0].mouth = 0.07  # both talking: no clear speaker, stay put
+    assert target_center(far, crop_frac, prev=0.2, follow_speaker=True) == pytest.approx(0.2)

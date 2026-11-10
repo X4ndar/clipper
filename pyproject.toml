@@ -18,6 +18,10 @@ dependencies = [
 dev = ["pytest==9.2.0"]
 # Face-following crop (M3). Without it, clips use a center crop.
 reframe = ["mediapipe==1.2.2"]
+# Web interface (clipper serve).
+web = ["fastapi==0.162.3", "uvicorn==0.54.0"]
+# Download a finished stream from a link (Twitch, Kick, ...).
+fetch = ["yt-dlp==2026.10.26"]
 
 [project.scripts]
 clipper = "clipper.cli:app"

@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from .config import ContentType
 
-STAGES = ["ingest", "transcribe", "quality", "candidates", "judge", "snap", "reframe", "captions", "render", "metadata", "report"]
+STAGES = ["ingest", "transcribe", "quality", "signals", "candidates", "judge", "snap", "reframe", "captions", "render", "metadata", "report"]
 STAGE_ALIASES = {
     "transcript": "quality",  # transcript + quality check (free) before any LLM spend
     "judged": "judge",
@@ -39,6 +39,8 @@ class JobSpec(BaseModel):
     min_duration: float = 20.0
     max_duration: float = 60.0
     speakers: Optional[int] = None
+    chat: Optional[str] = None  # chat log saved with the VOD (see signals.py)
+    direction: Optional[str] = None  # free-text steer for selection, e.g. "funny fails only"
     rights_confirmed: bool = False
 
 

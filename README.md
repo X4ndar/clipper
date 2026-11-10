@@ -55,7 +55,7 @@ uv run clipper run episode.mp4 --i-own-rights --content-type podcast --max-clips
 
 Options: `--language` (default auto-detect), `--content-type` (podcast, interview, talking_head,
 tutorial, other), `--max-clips`, `--min-duration` / `--max-duration` (default 20-60 s; clips up to
-90 s pass only with a higher score), `--speakers N`, `--stop-at STAGE`, `--from STAGE`,
+90 s pass only with a higher score), `--speakers N`, `--chat FILE`, `--direction TEXT`, `--stop-at STAGE`, `--from STAGE`,
 `--set key=value` for any config key.
 
 Output lands in `$CLIPPER_HOME/jobs/<name>-<hash>/` (default `~/.clipper`):
@@ -72,7 +72,7 @@ Output lands in `$CLIPPER_HOME/jobs/<name>-<hash>/` (default `~/.clipper`):
 
 ### Stages
 
-`ingest → transcribe → quality → candidates → judge → snap → reframe → captions → render → metadata → report`
+`ingest → transcribe → quality → signals → candidates → judge → snap → reframe → captions → render → metadata → report`
 
 Each stage reads and writes files in the job folder, so any stage can be re-run alone. Aliases for
 `--stop-at`: `transcript` (= quality), `selection`, `clips` (= render).
@@ -200,6 +200,52 @@ Models are config values: `llm.candidate_model` (default `claude-haiku-5-5`) and
 parameters, output, tokens, cost) in SQLite. The judge call opts into Anthropic's server-side
 refusal fallback (`llm.judge_fallbacks: default`; set to `null` to turn it off). Transcription
 always sends `speech_models: ["universal-3-5-pro"]` explicitly (`transcribe.speech_models`).
+
+### Claude subscription instead of an API key
+
+`--set llm.backend=claude_code` (or `llm: {backend: claude_code}` in config.yaml) sends the two LLM
+passes through the Claude Code CLI, which uses the Claude subscription you are logged in with. It
+needs `claude` on PATH and a login (`claude`, then `/login`); no `ANTHROPIC_API_KEY`. Each call runs
+with no tools, no project settings and no saved session. Calls count against your subscription's
+usage limits, so cost is logged as $0; the CLI's API-equivalent estimate is kept in the run log.
+There is no refusal fallback on this backend.
+
+### Streams, challenges and other event-driven videos
+
+```bash
+uv run clipper run stream.mp4 --i-own-rights --content-type stream --chat stream_chat.json --direction "funny fails and clutch wins"
+```
+
+`--content-type stream` (or `challenge`) changes four things:
+
+- **Prompts.** `llm.candidate_prompt` / `llm.judge_prompt` default to `auto`: `candidates_v2` and
+  `judge_v2` for these types (they look for an arc: setup, attempt, outcome, reaction), v1 for the rest.
+- **Signals.** The free `signals` stage scores every second of the video against its own rolling
+  baseline: audio loudness, and chat rate when `--chat` is given. Chat files: TwitchDownloader JSON,
+  yt-dlp `.live_chat.json`, or text lines `[HH:MM:SS] user: message`. Messages with emotes or hype
+  words count extra, and chat is shifted 5 s earlier because viewers type after the moment. Agreement
+  between audio and chat scores higher than either alone. Output: `signals.json`.
+- **Peak-first selection** (`selection.mode`, default `auto`). Each of the strongest peaks becomes a
+  candidate window (40 s before, 15 s after) that the judge trims to the real setup and reaction.
+  Videos up to 45 minutes use `both` (LLM pass 1 plus peaks); longer ones use `peaks` only, so a
+  4-hour stream costs about `max_clips x 3` judge calls and no pass over the whole transcript.
+  A peak with nobody talking around it is skipped.
+- **Layout** (`render.layout`, default `auto`). For `stream`, if a small face sits in the same place
+  across the clips (a camera overlay), clips are stacked: camera on top, gameplay below. Set the
+  camera box yourself with `--set reframe.facecam_region=0.75,0.70,0.25,0.30` (x, y, w, h as shares of
+  the frame), or force it on any video with `--set render.layout=stack`.
+
+For every content type, the loudness and chat around a clip now fill the `speaker_energy` part of the
+editorial score, and `--direction "..."` steers both LLM passes in plain words.
+
+When several people are on screen and do not all fit, the crop prefers the face whose mouth is moving
+(`reframe.follow_speaker`). This is a pixel-change heuristic on 4 frames per second, not a speaker
+model; it has unit tests but no accuracy measurement yet.
+
+Measured on one 22-minute challenge video (Claude subscription backend): v1 prompts selected 0 clips;
+v2 with transcript only selected 4; v2 with audio peaks judged 19 candidates and selected 4, two of
+them found only by the peaks. None of this is measured on a gold set yet, and chat scoring has only
+been tested on synthetic chat.
 
 ## Selection, in short
 

@@ -50,10 +50,12 @@ SetOpt = typer.Option(None, "--set", "-s", help="override any config key, e.g. -
 
 @app.command()
 def run(
-    video: Path = typer.Argument(..., help="Local video file you own or have rights to."),
+    video: str = typer.Argument(..., help="Video file, or the link of a finished stream (Twitch, Kick, ...). Yours, or one you have rights to."),
     i_own_rights: bool = typer.Option(False, "--i-own-rights", help="Required. Confirms you own or have rights to the video."),
     language: Optional[str] = typer.Option(None, help="Language code, e.g. en, fr, ar. Default: auto-detect."),
-    content_type: str = typer.Option("podcast", help="podcast | interview | talking_head | tutorial | other"),
+    content_type: str = typer.Option("podcast", help="podcast | interview | talking_head | tutorial | stream | challenge | other"),
+    chat: Optional[Path] = typer.Option(None, help="Chat log saved with the VOD (TwitchDownloader JSON, yt-dlp live chat, or [HH:MM:SS] lines)."),
+    direction: Optional[str] = typer.Option(None, help="Steer the selection in plain words, e.g. \"funny fails only\"."),
     max_clips: Optional[int] = typer.Option(None, help="Maximum clips to output (default from config: 8)."),
     min_duration: Optional[float] = typer.Option(None, help="Minimum clip length in seconds (default 20)."),
     max_duration: Optional[float] = typer.Option(None, help="Target maximum clip length in seconds (default 60)."),
@@ -67,12 +69,28 @@ def run(
     """Process one video: transcribe, select, cut, caption, report."""
     cfg = _cfg(config, set_)
     sel = cfg.selection
+    from .fetch import FetchError, fetch_source, is_url
+
+    source_url = None
+    if is_url(video):
+        if not i_own_rights:
+            _fail("pass --i-own-rights to confirm you own or have rights to this stream")
+        from .pipeline import _print_progress
+
+        try:
+            got = fetch_source(video, cfg, _print_progress, want_chat=chat is None)
+        except FetchError as e:
+            _fail(str(e))
+        source_url, video = video, str(got.video)
+        if chat is None and got.chat:
+            chat = got.chat
     spec = JobSpec(
         video=str(video), language=language, content_type=content_type,  # type: ignore[arg-type]
         max_clips=max_clips if max_clips is not None else sel.max_clips,
         min_duration=min_duration if min_duration is not None else sel.min_duration,
         max_duration=max_duration if max_duration is not None else sel.max_duration,
         speakers=speakers, rights_confirmed=i_own_rights,
+        chat=str(chat.expanduser().resolve()) if chat else None, direction=direction,
     )
     if spec.max_duration > sel.hard_cap_duration:
         _fail(f"--max-duration cannot exceed {sel.hard_cap_duration:.0f}s (Shorts maximum)")
@@ -80,7 +98,10 @@ def run(
         _fail("--min-duration must be below --max-duration")
     db = _db(cfg)
     try:
-        job = create_job(video, spec, cfg, db, job_id)
+        job = create_job(Path(video), spec, cfg, db, job_id)
+        if source_url:
+            job.state["source_url"] = source_url
+            job.save()
         typer.echo(f"job {job.id} -> {job.dir}")
         state = run_job(job, cfg, db, stop_at=stop_at, from_stage=from_stage)
     except (PipelineError, ValueError, FileNotFoundError) as e:
@@ -378,6 +399,56 @@ def eval_summary(config: Optional[str] = ConfigOpt):
 
     cfg = _cfg(config, None)
     typer.echo(json.dumps(summarize(_db(cfg).list_evals()), indent=2))
+
+
+@app.command()
+def fetch(
+    url: str = typer.Argument(..., help="Link of a finished stream you own or have rights to."),
+    i_own_rights: bool = typer.Option(False, "--i-own-rights", help="Required."),
+    config: Optional[str] = ConfigOpt,
+    set_: Optional[list[str]] = SetOpt,
+):
+    """Download a finished stream and its chat replay without processing it."""
+    from .fetch import FetchError, fetch_source
+    from .pipeline import _print_progress
+
+    if not i_own_rights:
+        _fail("pass --i-own-rights to confirm you own or have rights to this stream")
+    try:
+        got = fetch_source(url, _cfg(config, set_), _print_progress)
+    except FetchError as e:
+        _fail(str(e))
+    typer.echo(json.dumps({"video": str(got.video), "chat": str(got.chat) if got.chat else None,
+                           "title": got.title, "notes": got.notes}, indent=2, ensure_ascii=False))
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Address to listen on. Keep 127.0.0.1 unless you know why."),
+    port: int = typer.Option(8765, help="Port."),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the page in your browser."),
+    config: Optional[str] = ConfigOpt,
+    set_: Optional[list[str]] = SetOpt,
+):
+    """Start the web interface."""
+    try:
+        import uvicorn
+
+        from .web.server import create_app
+    except ImportError:
+        _fail("the web interface needs extra packages: uv sync --frozen --extra web (add the other extras you use)")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        typer.secho("warning: the web interface has no login. Anyone who can reach this address can start "
+                    "jobs and read files this user can read.", fg=typer.colors.YELLOW, err=True)
+    web = create_app(config, parse_set_overrides(set_ or []), allow_remote=host not in ("127.0.0.1", "localhost", "::1"))
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}"
+    typer.echo(f"clipper is running at {url}  (Ctrl+C to stop)")
+    if open_browser:
+        import threading
+        import webbrowser
+
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    uvicorn.run(web, host=host, port=port, log_level="warning")
 
 
 def main() -> None:  # pragma: no cover

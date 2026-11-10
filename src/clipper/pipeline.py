@@ -15,9 +15,15 @@ from .config import Config
 from .db import DB
 from .jobs import STAGES, Job, JobSpec, jobs_root, resolve_stage, slugify
 from .llm.client import LLMService, get_backend
-from .reframe import CropPlan, ReframeError, concat_plans, get_detector, reframe_clip, write_plan
-from .render import DynamicCrop, prepare_fonts_dir, render_clip
-from .select import ClipRecord, clip_spans, finalize, generate_candidates, judge_candidates
+from .reframe import (
+    CropPlan, Face, ReframeError, concat_plans, detect_facecam, facecam_region, get_detector, reframe_clip,
+    stack_geometry, write_plan,
+)
+from .render import DynamicCrop, StackLayout, prepare_fonts_dir, render_clip
+from .select import (
+    ClipRecord, clip_spans, editorial_score, finalize, generate_candidates, iou, judge_candidates,
+    peak_candidates, resolve_prompt, selection_mode,
+)
 from .transcribe import TranscribeRequest, TranscriptionError, get_transcriber
 from .transcript import Transcript, is_rtl, quality_check, to_srt
 
@@ -96,7 +102,7 @@ def create_job(video: Path, spec: JobSpec, cfg: Config, db: DB, job_id: Optional
         k: v for k, v in job.state["spec"].items() if k != "rights_confirmed"
     }:
         # Inputs changed: keep transcript work, redo selection onward.
-        for st in STAGES[STAGES.index("candidates"):]:
+        for st in STAGES[STAGES.index("signals"):]:
             job.state.get("stages", {}).pop(st, None)
     job.save()
     db.upsert_job(jid, str(video), sha, "created", job.state["spec"])
@@ -214,22 +220,78 @@ def st_quality(ctx: Ctx) -> None:
         )
 
 
+def st_signals(ctx: Ctx) -> None:
+    """Audio loudness and chat-rate peaks (signals.json). Free: no API calls."""
+    from .signals import SignalError, compute_signals
+
+    sc = ctx.cfg.signals
+    wav = ctx.job.path("audio.wav")
+    if not sc.enabled or not wav.is_file():
+        ctx.job.write_json("signals.json", {"peaks": [], "combined": [], "has_chat": False, "disabled": True})
+        return
+    chat = Path(ctx.spec.chat) if ctx.spec.chat else None
+    want = max(1, int(ctx.spec.max_clips * ctx.cfg.llm.candidate_multiplier))
+    try:
+        sig = compute_signals(wav, chat, sc, want)
+    except SignalError as e:
+        raise PipelineError(str(e)) from e
+    ctx.job.write_json("signals.json", sig)
+    msg = f"{len(sig['peaks'])} peaks from audio"
+    if sig["has_chat"]:
+        msg += f" and {sig['chat_messages']} chat messages"
+    ctx.progress("signals", "info", msg)
+
+
+def _signals(ctx: Ctx) -> dict:
+    p = ctx.job.path("signals.json")
+    return ctx.job.read_json("signals.json") if p.is_file() else {"peaks": [], "combined": []}
+
+
 def _spec_dict(ctx: Ctx) -> dict:
     s = ctx.spec
     return {"content_type": s.content_type, "max_clips": s.max_clips, "min_duration": s.min_duration,
-            "max_duration": s.max_duration}
+            "max_duration": s.max_duration, "direction": s.direction}
 
 
 def st_candidates(ctx: Ctx) -> None:
     ctx.job.state.pop("selection_source", None)  # the LLM selects again, replacing any hand picks
-    records, invalid = generate_candidates(ctx.transcript(), _spec_dict(ctx), ctx.cfg, ctx.llm())
-    ctx.save_records("candidates.json", records, invalid=invalid)
-    ctx.progress("candidates", "info", f"{len(records)} candidates ({len(invalid)} invalid dropped)")
+    tr, spec, sig = ctx.transcript(), _spec_dict(ctx), _signals(ctx)
+    mode = selection_mode(ctx.cfg, spec["content_type"], tr.duration, bool(sig.get("peaks")))
+    records: list[ClipRecord] = []
+    invalid: list[dict] = []
+    if mode in ("transcript", "both"):
+        records, invalid = generate_candidates(tr, spec, ctx.cfg, ctx.llm())
+    n_llm = len(records)
+    if mode in ("peaks", "both"):
+        for p in peak_candidates(tr, sig, spec, ctx.cfg):
+            a = (tr.sentences[p.start_sentence_id].start, tr.sentences[p.end_sentence_id].end)
+            dup = next((k for k in records if k.status == "pending" and iou(
+                a, (tr.sentences[k.start_sentence_id].start, tr.sentences[k.end_sentence_id].end)) > 0.7), None)
+            if dup is not None:
+                dup.pass1["peak_t"] = p.pass1["peak_t"]  # the LLM found the same moment: keep one
+                continue
+            records.append(p)
+    ctx.job.stats()["selection_mode"] = mode
+    ctx.save_records("candidates.json", records, invalid=invalid, mode=mode)
+    ctx.progress("candidates", "info", f"mode {mode}: {n_llm} from the transcript, {len(records) - n_llm} from "
+                 f"signal peaks ({len(invalid)} invalid dropped)")
 
 
 def st_judge(ctx: Ctx) -> None:
+    from .signals import energy_score
+
+    tr = ctx.transcript()
     records = ctx.records("candidates.json")
-    records = judge_candidates(ctx.transcript(), records, _spec_dict(ctx), ctx.cfg, ctx.llm())
+    records = judge_candidates(tr, records, _spec_dict(ctx), ctx.cfg, ctx.llm())
+    sig = _signals(ctx)
+    if sig.get("combined"):
+        # Loudness and chat around the clip, as the "speaker_energy" part of the editorial score.
+        for r in records:
+            if r.status == "accepted":
+                e = energy_score(sig, tr.sentences[r.start_sentence_id].start, tr.sentences[r.end_sentence_id].end)
+                if e is not None:
+                    r.scores["speaker_energy"] = e
+                    r.editorial = editorial_score(r.scores, ctx.cfg.selection.weights)
     ctx.save_records("judged.json", records)
     acc = sum(r.status == "accepted" for r in records)
     ctx.progress("judge", "info", f"{acc} of {len(records)} passed the judge")
@@ -266,6 +328,7 @@ def st_reframe(ctx: Ctx) -> None:
     for r in records:
         r.files.pop("crop", None)
         r.files.pop("crop_cmd", None)
+        r.files.pop("layout", None)
     detector = None
     if sel and rc.reframe == "face" and not _is_vertical(src):
         try:
@@ -274,6 +337,7 @@ def st_reframe(ctx: Ctx) -> None:
             ctx.job.warn(f"Face reframing is off, using a center crop: {e}")
             ctx.progress("reframe", "warn", str(e))
     if detector is None:
+        _plan_stack(ctx, sel, src)
         ctx.save_records("selection.json", records)
         return
     ctx.job.clips_dir.mkdir(parents=True, exist_ok=True)
@@ -305,10 +369,54 @@ def st_reframe(ctx: Ctx) -> None:
         ctx.progress("reframe", "info", f"clip {i}/{len(sel)}: {m['shots']} shots, faces in {m['face_share']:.0%} "
                      f"of frames; a face fully in frame {inside} (center crop {center}), "
                      f"a face sliced by the edge {cut} (center crop {cut_c})")
+    _plan_stack(ctx, sel, src)
     ctx.save_records("selection.json", records)
 
 
-def load_crop(job: Job, r: ClipRecord) -> Optional[tuple[CropPlan, DynamicCrop]]:
+def _plan_stack(ctx: Ctx, sel: list[ClipRecord], src: dict) -> None:
+    """Decide on the camera-over-gameplay layout for this job and write facecam.json."""
+    rc, rf = ctx.cfg.render, ctx.cfg.reframe
+    ctx.job.path("facecam.json").unlink(missing_ok=True)
+    want = rc.layout == "stack" or (rc.layout == "auto" and ctx.spec.content_type == "stream")
+    if not want or not sel or _is_vertical(src):
+        return
+    region = None
+    if rf.facecam_region:
+        try:
+            region = tuple(float(v) for v in rf.facecam_region.split(","))
+            assert len(region) == 4 and all(0 <= v <= 1 for v in region)
+        except (ValueError, AssertionError):
+            raise PipelineError("reframe.facecam_region must be \"x,y,w,h\" with values between 0 and 1") from None
+    else:
+        samples: list[list[Face]] = []
+        for r in sel:
+            for f in sorted(ctx.job.clips_dir.glob(f"{clip_name(r)}.faces*.json")):
+                blob = json.loads(f.read_text(encoding="utf-8"))
+                samples += [[Face(**x) for x in fs] for fs in blob.get("faces", [])]
+        face = detect_facecam(samples)
+        if face is not None:
+            region = facecam_region(face, src["width"], src["height"])
+    if region is None:
+        msg = ("No streamer camera found, so clips use a single crop. If there is one, set "
+               "reframe.facecam_region=\"x,y,w,h\".")
+        if rc.layout == "stack":
+            ctx.job.warn(msg)
+        ctx.progress("reframe", "warn" if rc.layout == "stack" else "info", msg)
+        return
+    geo = stack_geometry(src["width"], src["height"], rc.width, rc.height, rf.stack_top_share, region)
+    ctx.job.write_json("facecam.json", {"region": [round(v, 4) for v in region], **geo})
+    for r in sel:
+        r.files["layout"] = "stack"
+    ctx.progress("reframe", "info", f"stack layout: camera at x={region[0]:.2f} y={region[1]:.2f} "
+                 f"w={region[2]:.2f} h={region[3]:.2f} on top, gameplay below")
+
+
+def load_crop(job: Job, r: ClipRecord):
+    """(plan, crop) for a clip: a CropPlan with its DynamicCrop, (None, StackLayout) for the stacked
+    layout, or None for a plain center crop."""
+    if r.files.get("layout") == "stack" and job.path("facecam.json").is_file():
+        g = job.read_json("facecam.json")
+        return None, StackLayout(g["cam"], g["game"], g["top_h"], g["bot_h"])
     pj, pc = r.files.get("crop"), r.files.get("crop_cmd")
     if not pj or not pc or not (job.dir / pj).is_file() or not (job.dir / pc).is_file():
         return None
@@ -389,6 +497,8 @@ def render_one(ctx: Ctx, r: ClipRecord, fonts: Path, wav: Optional[media.Wav]) -
     elif crop is None:
         crop_ok = None
         render_reasons.add("center crop on wide source: check framing")
+    elif crop[0] is None:
+        crop_ok, framing = True, {"layout": "stack"}
     else:
         framing = crop[0].metrics
         inside = framing.get("face_in_frame")
@@ -473,7 +583,9 @@ def st_metadata(ctx: Ctx) -> None:
     st["cost_per_source_hour_usd"] = round(st["total_cost_usd"] / hours, 4) if hours else None
     ctx.job.write_json("clips.json", {
         "job_id": ctx.job.id, "source": ctx.spec.video, "privacy_default": "private",
-        "prompts": {"candidates": ctx.cfg.llm.candidate_prompt, "judge": ctx.cfg.llm.judge_prompt},
+        "prompts": {"candidates": resolve_prompt(ctx.cfg.llm.candidate_prompt, "candidates", ctx.spec.content_type),
+                    "judge": resolve_prompt(ctx.cfg.llm.judge_prompt, "judge", ctx.spec.content_type)},
+        "selection_mode": ctx.job.stats().get("selection_mode"),
         "models": {"candidates": ctx.cfg.llm.candidate_model, "judge": ctx.cfg.llm.judge_model},
         "clips": clips,
     })
@@ -486,7 +598,7 @@ def st_report(ctx: Ctx) -> None:
 
 
 STAGE_FUNCS: dict[str, Callable[[Ctx], None]] = {
-    "ingest": st_ingest, "transcribe": st_transcribe, "quality": st_quality, "candidates": st_candidates,
+    "ingest": st_ingest, "transcribe": st_transcribe, "quality": st_quality, "signals": st_signals, "candidates": st_candidates,
     "judge": st_judge, "snap": st_snap, "reframe": st_reframe, "captions": st_captions, "render": st_render, "metadata": st_metadata,
     "report": st_report,
 }
@@ -570,7 +682,7 @@ def apply_picks(job: Job, cfg: Config, db: DB, picks_path: Path, progress: Progr
     job.write_json("candidates.json", blob)
     job.write_json("judged.json", blob)
     job.state["selection_source"] = f"hand-picked ({picks_path.name})"
-    for st in ("candidates", "judge"):
+    for st in ("signals", "candidates", "judge"):  # hand picks replace everything before snap
         job.mark(st, "done", 0.0)
     progress("picks", "info", f"{len(records)} hand-picked clips from {picks_path.name}")
     return run_job(job, cfg, db, from_stage="snap", progress=progress, face_detector=face_detector)
