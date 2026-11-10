@@ -232,6 +232,10 @@ class LLMService:
 
     def call(self, call: LLMCall, stage: str) -> LLMResponse:
         h = call.input_hash()
+        backend_name = getattr(self.backend, "name", "anthropic")
+        if backend_name != "anthropic":
+            # Keep offline (fake/test) answers out of the real backend's response cache.
+            h = hashlib.sha256(f"{backend_name}:{h}".encode()).hexdigest()
         if self.cfg.cache_responses:
             with self._lock:
                 row = self.db.find_cached_llm(h)
@@ -264,7 +268,9 @@ class LLMService:
             try:
                 parsed, usage, stop, model_used = self.backend.complete(call)
                 secs = time.monotonic() - t0
-                cost = cost_usd(call.model, usage, self.cfg.prices_per_mtok)
+                # A refusal fallback bills at the serving model's rates.
+                priced = model_used if model_used in self.cfg.prices_per_mtok else call.model
+                cost = cost_usd(priced, usage, self.cfg.prices_per_mtok)
                 if parsed is None:
                     raise LLMError(f"no parsable output (stop_reason={stop})")
                 with self._lock:

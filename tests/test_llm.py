@@ -79,6 +79,15 @@ def test_cache_hit_costs_nothing(tmp_path):
     assert r2.cached and r2.cost_usd == 0 and b.calls == 1
 
 
+def test_cache_is_per_backend(tmp_path):
+    first = ScriptedBackend([GOOD_P1])
+    svc(tmp_path, first).call(call(), "candidates")
+    other = ScriptedBackend([GOOD_P1])
+    other.name = "anthropic"
+    r = svc(tmp_path, other).call(call(), "candidates")
+    assert not r.cached and other.calls == 1
+
+
 def test_budget_guard(tmp_path):
     b = ScriptedBackend([GOOD_P1, GOOD_P1])
     s = svc(tmp_path, b, budget=0.0001, cache_responses=False)

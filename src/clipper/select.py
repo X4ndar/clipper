@@ -51,6 +51,16 @@ class ClipRecord(BaseModel):
     long_clip: bool = False
     rank: Optional[int] = None
     files: dict[str, str] = Field(default_factory=dict)
+    # Hand-edited clips (picks.py) may join several spans with jump cuts, played in this order.
+    # Each: {start_sentence_id, end_sentence_id} and, after finalize(), w0, w1, start, end.
+    segments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def clip_spans(r: ClipRecord) -> list[tuple[float, float, int, int]]:
+    """(start, end, w0, w1) per piece of the clip, in play order. One piece unless jump-cut."""
+    if r.segments:
+        return [(g["start"], g["end"], g["w0"], g["w1"]) for g in r.segments]
+    return [(r.start, r.end, r.w0, r.w1)]
 
 
 def estimate_tokens(text: str) -> int:
@@ -274,6 +284,32 @@ def jaccard(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb) if sa and sb else 0.0
 
 
+def manual(r: ClipRecord) -> bool:
+    """Picked by hand (see picks.py), not by the LLM passes."""
+    return r.pass1.get("source") == "manual"
+
+
+def _finalize_segments(tr: Transcript, r: ClipRecord, wav: Optional[Wav], cfg) -> None:
+    """Snap every piece of a jump-cut clip on its own; the clip's span and text cover all pieces."""
+    oks, words, texts = [], [], []
+    for g in r.segments:
+        b = compute_bounds(tr, g["start_sentence_id"], g["end_sentence_id"], 0, 0, wav, cfg.snap)
+        g.update({"w0": b.w0, "w1": b.w1, "start": b.start, "end": b.end})
+        r.notes.extend(b.notes)
+        oks.append(boundary_ok(tr, b))
+        words += tr.words[b.w0 : b.w1 + 1]
+        texts.append(tr.text_range(b.w0, b.w1))
+    first, last = r.segments[0], r.segments[-1]
+    r.w0, r.w1 = first["w0"], last["w1"]
+    r.start = min(g["start"] for g in r.segments)
+    r.end = max(g["end"] for g in r.segments)
+    r.duration = round(sum(g["end"] - g["start"] for g in r.segments), 3)
+    r.text = " … ".join(texts)
+    asr = word_confidence(words)
+    r.confidence.update({"asr": round(asr, 3) if asr is not None else None, "boundary_ok": all(oks),
+                         "combined": round(asr, 3) if asr is not None else None})
+
+
 def finalize(tr: Transcript, records: list[ClipRecord], spec: dict, cfg, wav: Optional[Wav]) -> list[ClipRecord]:
     sel = cfg.selection
     lo, hi = spec["min_duration"], spec["max_duration"]
@@ -281,6 +317,15 @@ def finalize(tr: Transcript, records: list[ClipRecord], spec: dict, cfg, wav: Op
     pool: list[ClipRecord] = []
     for r in records:
         if r.status != "accepted":
+            continue
+        if r.segments:
+            _finalize_segments(tr, r, wav, cfg)
+            if r.duration > sel.hard_cap_duration:
+                r.status = "out_of_range"
+                r.status_reason = f"too long ({r.duration:.1f}s > {sel.hard_cap_duration:.0f}s hard cap)"
+                continue
+            r.long_clip = r.duration > hi
+            pool.append(r)
             continue
         b: Bounds = compute_bounds(tr, r.start_sentence_id, r.end_sentence_id, r.start_word_offset,
                                    r.end_word_offset, wav, cfg.snap)
@@ -298,6 +343,14 @@ def finalize(tr: Transcript, records: list[ClipRecord], spec: dict, cfg, wav: Op
             "combined": round(min(x for x in (llm_c, asr) if x is not None), 3)
             if (llm_c is not None or asr is not None) else None,
         })
+        if manual(r):  # a person chose this span: only the hard cap applies
+            if r.duration > sel.hard_cap_duration:
+                r.status = "out_of_range"
+                r.status_reason = f"too long ({r.duration:.1f}s > {sel.hard_cap_duration:.0f}s hard cap)"
+                continue
+            r.long_clip = r.duration > hi
+            pool.append(r)
+            continue
         if r.duration < lo:
             r.status, r.status_reason = "out_of_range", f"too short ({r.duration:.1f}s < {lo:.0f}s)"
             continue
@@ -330,7 +383,7 @@ def finalize(tr: Transcript, records: list[ClipRecord], spec: dict, cfg, wav: Op
         if dup:
             r.status, r.status_reason = "duplicate", f"overlaps higher-ranked {dup.id}"
             continue
-        if len(kept) >= spec["max_clips"]:
+        if len(kept) >= spec["max_clips"] and not manual(r):
             r.status, r.status_reason = "over_quota", f"max_clips={spec['max_clips']} already filled"
             continue
         kept.append(r)

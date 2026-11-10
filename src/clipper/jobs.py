@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from .config import ContentType
 
-STAGES = ["ingest", "transcribe", "quality", "candidates", "judge", "snap", "captions", "render", "metadata", "report"]
+STAGES = ["ingest", "transcribe", "quality", "candidates", "judge", "snap", "reframe", "captions", "render", "metadata", "report"]
 STAGE_ALIASES = {
     "transcript": "quality",  # transcript + quality check (free) before any LLM spend
     "judged": "judge",

@@ -27,7 +27,8 @@ def require_tools() -> None:
 
 
 def run(cmd: list[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # ffmpeg/ffprobe write UTF-8; don't rely on the locale codec (cp1252 on Windows).
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-15:])
         raise MediaError(f"command failed ({proc.returncode}): {' '.join(cmd[:6])} ...\n{tail}")

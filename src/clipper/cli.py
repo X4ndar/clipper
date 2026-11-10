@@ -15,7 +15,7 @@ from .config import (
 )
 from .db import DB
 from .jobs import STAGE_ALIASES, STAGES, JobSpec, find_job
-from .pipeline import PipelineError, create_job, rerender_clip, run_job
+from .pipeline import PipelineError, apply_picks, create_job, rerender_clip, run_job
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Long video to vertical Shorts clipper.")
 eval_app = typer.Typer(no_args_is_help=True, help="Gold set, labeling and metrics.")
@@ -138,6 +138,24 @@ def resume(
 
 
 @app.command()
+def picks(
+    job: str = typer.Argument(..., help="Job id (or a unique prefix)."),
+    file: Path = typer.Argument(..., help="JSON list of clips: start/end times (\"9:50.5\") or sentence IDs."),
+    config: Optional[str] = ConfigOpt,
+    set_: Optional[list[str]] = SetOpt,
+):
+    """Render hand-picked clips instead of the LLM's selection (see src/clipper/picks.py for the format)."""
+    cfg = _cfg(config, set_)
+    db = _db(cfg)
+    try:
+        j = find_job(cfg.home_path, job)
+        state = apply_picks(j, cfg, db, file)
+    except (PipelineError, ValueError, FileNotFoundError) as e:
+        _fail(str(e))
+    _summary(j, state)
+
+
+@app.command()
 def jobs(limit: int = 20, config: Optional[str] = ConfigOpt):
     """List job history."""
     cfg = _cfg(config, None)
@@ -181,7 +199,7 @@ def preview(
 ):
     """Render a single frame with the current caption style, to tune it in seconds."""
     from .captions import build_ass, load_doc
-    from .pipeline import Ctx, clip_name, selected, _print_progress
+    from .pipeline import Ctx, clip_name, load_crop, selected, source_offset, _print_progress
     from .render import prepare_fonts_dir, render_frame
 
     cfg = _cfg(config, set_)
@@ -199,7 +217,9 @@ def preview(
                    encoding="utf-8")
     png = out or (j.clips_dir / f"{name}.preview.png")
     fonts = prepare_fonts_dir(cfg.captions, cfg.home_path, j.path("fonts"))
-    render_frame(Path(j.spec.video), png, r.start, at, cfg.render, ass, fonts)
+    crop = load_crop(j, r)
+    render_frame(Path(j.spec.video), png, source_offset(r, at), at, cfg.render, ass, fonts,
+                 crop[1] if crop else None)
     typer.echo(png)
 
 

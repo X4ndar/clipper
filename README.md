@@ -6,8 +6,9 @@ model proposes candidates, a stronger model judges them against hard gates (stan
 payoff), and code snaps every cut to word boundaries and quiet audio. Every candidate, including
 the rejected ones and why, ends up in an HTML review report. Nothing is published.
 
-Status: milestone M1 (CLI, selection, center-crop render, report, eval harness) and a basic M2
-(captions) are built and tested offline. See [PLAN.md](PLAN.md) for the roadmap and
+Status: milestone M1 (CLI, selection, center-crop render, report, eval harness), a basic M2
+(captions) and the first part of M3 (face-following crop) are built. Real AssemblyAI transcription
+has been run; real Claude calls have not. See [PLAN.md](PLAN.md) for the roadmap and
 [What is verified](#what-is-verified) before relying on the numbers below.
 
 ## Rules
@@ -19,11 +20,15 @@ Status: milestone M1 (CLI, selection, center-crop render, report, eval harness) 
 ## Setup
 
 Needs Python 3.11+, [uv](https://docs.astral.sh/uv/), and ffmpeg built with libass (Debian and
-Ubuntu packages are).
+Ubuntu packages are). On Windows, the gyan.dev "full" build has libass and flite:
+`winget install --id Gyan.FFmpeg -e`, then open a new terminal so `ffmpeg` is on PATH.
 
 ```bash
-uv sync --frozen --extra dev
+uv sync --frozen --extra dev --extra reframe
 ```
+
+The `reframe` extra (MediaPipe, about 300 MB with its dependencies) enables the face-following crop.
+Without it, clips use a center crop and the job records a warning.
 
 ```bash
 cp .env.example .env   # then fill in ASSEMBLYAI_API_KEY and ANTHROPIC_API_KEY
@@ -67,7 +72,7 @@ Output lands in `$CLIPPER_HOME/jobs/<name>-<hash>/` (default `~/.clipper`):
 
 ### Stages
 
-`ingest → transcribe → quality → candidates → judge → snap → captions → render → metadata → report`
+`ingest → transcribe → quality → candidates → judge → snap → reframe → captions → render → metadata → report`
 
 Each stage reads and writes files in the job folder, so any stage can be re-run alone. Aliases for
 `--stop-at`: `transcript` (= quality), `selection`, `clips` (= render).
@@ -96,6 +101,30 @@ The quality stage flags a transcript before any LLM tokens are spent: share of l
 repeated n-gram loops, repeated sentences, implausible speech rate, and languages with weak ASR
 support (with an explicit warning for Arabic dialects such as Darija).
 
+### Framing
+
+`render.reframe: face` (default) keeps faces in the 9:16 crop. Per clip, the `reframe` stage finds
+shot cuts on every frame, detects faces on 4 frames per second (MediaPipe BlazeFace full-range, CPU;
+the model is downloaded once to `$CLIPPER_HOME/models/` and checked by SHA-256), and plans a crop path:
+within a shot the crop holds still while the subject stays inside a dead zone and pans smoothly when
+it leaves; at a cut it jumps. If everyone fits, it frames the group; if not, the largest face, with
+near-ties going to the face it is already on or, at a new shot, the one nearest the middle.
+
+`clips/clip_NN.crop.json` holds the path and its framing numbers: how often a face is fully in frame
+and how often a face is sliced by the crop edge, each also computed for a plain center crop. They
+show in the report. A clip below `reframe.min_face_in_frame` (0.8) is flagged for review.
+Detections are cached in `clip_NN.faces.json`, so re-planning after a config change takes seconds:
+
+```bash
+uv run clipper resume episode-1a2b3c4d --from reframe --set reframe.dead_zone=0.1
+```
+
+Not done yet (rest of M3): following the active speaker, and split layouts for two people.
+`render.reframe: center` turns face following off.
+
+On Windows, a clip that is open in a video player or a browser tab (the report) cannot be replaced:
+close it before re-rendering.
+
 ### Captions
 
 Word-by-word highlight by default (`captions.mode`: `word`, `karaoke`, `plain`), 2 lines of about
@@ -108,6 +137,32 @@ uv run clipper preview episode-1a2b3c4d --clip 1 --at 2.0 --set captions.size=90
 
 Fonts: Noto Sans and Noto Sans Arabic (OFL) are bundled. Arabic and other RTL text is shaped by
 libass (tested with an Arabic sample). Add your own fonts to `$CLIPPER_HOME/fonts/`.
+
+### Hand-picked clips
+
+To choose clips yourself (or override the models), list them in a JSON file, best first, by time or
+by sentence ID from `transcript.json`:
+
+```json
+[{"start": "19:35", "end": "20:30", "title": "...", "hook_text": "..."},
+ {"start_sentence": 679, "end_sentence": 704}]
+```
+
+```bash
+uv run clipper picks episode-1a2b3c4d picks.json
+```
+
+To tighten a clip, give `segments` instead of one span. The pieces are joined with jump cuts (each
+with a short audio fade) and play in the order listed, so a clip can also open on its best line:
+
+```json
+{"segments": [{"start_sentence": 645, "end_sentence": 648}, {"start": "19:52.5", "end": "20:30"}],
+ "title": "..."}
+```
+
+Times snap to whole sentences, then the usual word-boundary snapping, reframing, captions and report
+run. Captions and the crop path follow the joins. Hand picks skip the length, score and clip-count limits (the 180 s hard cap still applies) and
+show as "hand-picked" in the report. Running `--from candidates` again lets the models select instead.
 
 ### Other commands
 
@@ -211,6 +266,7 @@ Measured in this repo's sandbox (4 vCPU, 15 GB RAM, no GPU), offline backends:
 | Ingest (hash + mono 16 kHz audio) of a 10-minute 1080p30 file | 3.2 s (about 20 s per hour, extrapolated) |
 | Render 8 clips, 340 s of 1080x1920 output, libx264 `veryfast` CRF 20, with captions | 107 s (3.2x faster than real time) |
 | Snapping, selection, captions, report | under 1 s |
+| Face reframing, 6 clips / 248 s of 720p source (laptop i7-1355U) | 19.5 s; moving crop adds about 20% to render time |
 
 Estimated for a one-hour podcast with real APIs (not measured here, no keys in the sandbox):
 
@@ -240,15 +296,22 @@ per hour) and a FLAC copy for upload (about half that).
 
 ## What is verified
 
-Tested here (55 tests, `make test`): boundary snapping on synthetic audio, clause-offset rules,
+Tested (68 tests, `make test`, on Windows 11; the first 55 also passed on Linux): boundary snapping on synthetic audio, clause-offset rules,
 JSON schema validation and retries, the LLM cache, budget guard and refusal handling, the Anthropic
 request shape (with a mock client), the AssemblyAI request and polling flow (with a mock HTTP
 server), ASS generation, config precedence, selection gates, dedupe and quota, the eval metrics,
 and a full end-to-end run on a generated two-speaker video (real ffmpeg, real speech audio,
-fixture transcript, deterministic fake LLM).
+fixture transcript, deterministic fake LLM), crop-path planning on synthetic face tracks, and a
+render with a moving crop.
 
-Not verified yet: a real AssemblyAI transcription, real Claude calls, clip quality on real
-podcasts, and the definition-of-done numbers (under 15 minutes and under $1 for one hour). The
+Run for real (Windows 11, i7-1355U, 2026-11-07): AssemblyAI Universal-3.5 Pro on a 22.5-minute
+video, $0.079, 22 s turnaround, word timestamps checked against the raw response; face reframing on
+6 clips of that video (about 4 minutes): planning took 19.5 s, and a face was fully in frame in
+85-98% of frames with faces, against 50-86% for a center crop. On fast-cut videos with background
+music, AssemblyAI squeezed about 4% of word timestamps into 10-20 ms runs; the quality check flags
+this as fast speech.
+
+Not verified yet: real Claude calls, clip quality on real podcasts, and the definition-of-done numbers (under 15 minutes and under $1 for one hour). The
 Docker image has not been built (no Docker daemon in the build sandbox).
 
 ## Development

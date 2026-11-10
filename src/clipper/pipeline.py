@@ -15,8 +15,9 @@ from .config import Config
 from .db import DB
 from .jobs import STAGES, Job, JobSpec, jobs_root, resolve_stage, slugify
 from .llm.client import LLMService, get_backend
-from .render import prepare_fonts_dir, render_clip
-from .select import ClipRecord, finalize, generate_candidates, judge_candidates
+from .reframe import CropPlan, ReframeError, concat_plans, get_detector, reframe_clip, write_plan
+from .render import DynamicCrop, prepare_fonts_dir, render_clip
+from .select import ClipRecord, clip_spans, finalize, generate_candidates, judge_candidates
 from .transcribe import TranscribeRequest, TranscriptionError, get_transcriber
 from .transcript import Transcript, is_rtl, quality_check, to_srt
 
@@ -43,6 +44,7 @@ class Ctx:
     progress: Progress
     llm_backend: object = None  # injectable for tests
     transcriber: object = None
+    face_detector: object = None
     _cache: dict = field(default_factory=dict)
 
     @property
@@ -219,6 +221,7 @@ def _spec_dict(ctx: Ctx) -> dict:
 
 
 def st_candidates(ctx: Ctx) -> None:
+    ctx.job.state.pop("selection_source", None)  # the LLM selects again, replacing any hand picks
     records, invalid = generate_candidates(ctx.transcript(), _spec_dict(ctx), ctx.cfg, ctx.llm())
     ctx.save_records("candidates.json", records, invalid=invalid)
     ctx.progress("candidates", "info", f"{len(records)} candidates ({len(invalid)} invalid dropped)")
@@ -250,6 +253,70 @@ def clip_name(r: ClipRecord) -> str:
     return f"clip_{r.rank:02d}"
 
 
+def _is_vertical(src: dict) -> bool:
+    return src["height"] >= src["width"] * 1.7
+
+
+def st_reframe(ctx: Ctx) -> None:
+    """Plan a face-following crop path per selected clip (writes clips/clip_NN.crop.json + .crop.cmd)."""
+    records = ctx.records("selection.json")
+    sel = selected(records)
+    src = ctx.job.read_json("source.json")
+    rc = ctx.cfg.render
+    for r in records:
+        r.files.pop("crop", None)
+        r.files.pop("crop_cmd", None)
+    detector = None
+    if sel and rc.reframe == "face" and not _is_vertical(src):
+        try:
+            detector = ctx.face_detector or get_detector(ctx.cfg.reframe, ctx.cfg.home_path)
+        except ReframeError as e:
+            ctx.job.warn(f"Face reframing is off, using a center crop: {e}")
+            ctx.progress("reframe", "warn", str(e))
+    if detector is None:
+        ctx.save_records("selection.json", records)
+        return
+    ctx.job.clips_dir.mkdir(parents=True, exist_ok=True)
+    fps = src.get("fps") or 30.0
+    for i, r in enumerate(sel, 1):
+        name = clip_name(r)
+        spans = clip_spans(r)
+        try:
+            plans = [
+                reframe_clip(Path(ctx.spec.video), a, b, src["width"], src["height"], fps, rc.width, rc.height,
+                             ctx.cfg.reframe, detector,
+                             faces_cache=ctx.job.clips_dir / (f"{name}.faces.json" if len(spans) == 1
+                                                              else f"{name}.faces.{k}.json"))
+                for k, (a, b, _, _) in enumerate(spans)
+            ]
+            plan = concat_plans(plans, [b - a for a, b, _, _ in spans])
+        except ReframeError as e:
+            ctx.job.warn(f"{name}: face reframing failed, using a center crop: {e}")
+            ctx.progress("reframe", "warn", f"{name}: {e}")
+            continue
+        write_plan(plan, ctx.job.clips_dir / f"{name}.crop.json", ctx.job.clips_dir / f"{name}.crop.cmd",
+                   r.duration, fps)
+        r.files.update({"crop": f"clips/{name}.crop.json", "crop_cmd": f"clips/{name}.crop.cmd"})
+        m = plan.metrics
+        inside = "n/a" if m["face_in_frame"] is None else f"{m['face_in_frame']:.0%}"
+        center = "n/a" if m["face_in_frame_center_crop"] is None else f"{m['face_in_frame_center_crop']:.0%}"
+        cut = "n/a" if m["face_cut"] is None else f"{m['face_cut']:.0%}"
+        cut_c = "n/a" if m["face_cut_center_crop"] is None else f"{m['face_cut_center_crop']:.0%}"
+        ctx.progress("reframe", "info", f"clip {i}/{len(sel)}: {m['shots']} shots, faces in {m['face_share']:.0%} "
+                     f"of frames; a face fully in frame {inside} (center crop {center}), "
+                     f"a face sliced by the edge {cut} (center crop {cut_c})")
+    ctx.save_records("selection.json", records)
+
+
+def load_crop(job: Job, r: ClipRecord) -> Optional[tuple[CropPlan, DynamicCrop]]:
+    pj, pc = r.files.get("crop"), r.files.get("crop_cmd")
+    if not pj or not pc or not (job.dir / pj).is_file() or not (job.dir / pc).is_file():
+        return None
+    plan = CropPlan.from_json(json.loads((job.dir / pj).read_text(encoding="utf-8")))
+    x0 = int(plan.xs[0]) if plan.xs else (plan.src_w - plan.crop_w) // 2
+    return plan, DynamicCrop(plan.crop_w, plan.crop_h, x0 - x0 % 2, plan.y, job.dir / pc)
+
+
 def st_captions(ctx: Ctx) -> None:
     tr = ctx.transcript()
     records = ctx.records("selection.json")
@@ -258,11 +325,37 @@ def st_captions(ctx: Ctx) -> None:
     for r in selected(records):
         name = clip_name(r)
         hook = r.hook_text if ctx.cfg.hook.enabled else None
-        doc = doc_from_words(tr.words[r.w0 : r.w1 + 1], r.start, r.duration, tr.language, hook)
+        doc = clip_caption_doc(tr, r, hook)
         write_caption_files(doc, ctx.job.clips_dir / f"{name}.ass", ctx.job.clips_dir / f"{name}.captions.json",
                             ctx.cfg.captions, ctx.cfg.hook, rc.width, rc.height)
         r.files.update({"ass": f"clips/{name}.ass", "captions_json": f"clips/{name}.captions.json"})
     ctx.save_records("selection.json", records)
+
+
+def clip_caption_doc(tr: Transcript, r: ClipRecord, hook: Optional[str]):
+    """Caption words on the clip's own timeline; jump-cut pieces are laid end to end."""
+    doc, off = None, 0.0
+    for a, b, w0, w1 in clip_spans(r):
+        part = doc_from_words(tr.words[w0 : w1 + 1], a - off, off + (b - a), tr.language, hook)
+        if doc is None:
+            doc = part
+        else:
+            doc.words += [w for w in part.words if w.start >= off - 1e-6]
+        off += b - a
+    doc.duration = round(off, 3)
+    return doc
+
+
+def source_offset(r: ClipRecord, at: float) -> float:
+    """For a time `at` on the clip's timeline, the source time where the clip would start if it were
+    one continuous piece there (what render_frame needs to find the right frame)."""
+    off = 0.0
+    spans = clip_spans(r)
+    for a, b, _, _ in spans:
+        if at < off + (b - a) or (a, b) == spans[-1][:2]:
+            return a - off
+        off += b - a
+    return r.start
 
 
 def _fonts(ctx: Ctx) -> Path:
@@ -274,14 +367,41 @@ def render_one(ctx: Ctx, r: ClipRecord, fonts: Path, wav: Optional[media.Wav]) -
     out = ctx.job.clips_dir / f"{name}.mp4"
     ass = ctx.job.clips_dir / f"{name}.ass"
     use_ass = ass if (ctx.cfg.captions.enabled or ctx.cfg.hook.enabled) and ass.is_file() else None
+    crop = load_crop(ctx.job, r)
     t0 = time.monotonic()
-    render_clip(Path(ctx.spec.video), out, r.start, r.end, ctx.cfg.render, ctx.cfg.snap.fade_ms, use_ass, fonts)
+    try:
+        spans = clip_spans(r)
+        render_clip(Path(ctx.spec.video), out, r.start, r.end, ctx.cfg.render, ctx.cfg.snap.fade_ms, use_ass,
+                    fonts, crop[1] if crop else None,
+                    segments=[(a, b) for a, b, _, _ in spans] if len(spans) > 1 else None)
+    except PermissionError as e:  # Windows: the old file is open in a player and cannot be replaced
+        raise PipelineError(
+            f"{out} is open in another program (a video player?). Close it, then run: "
+            f"clipper resume {ctx.job.id} --from render"
+        ) from e
     r.files["video"] = f"clips/{name}.mp4"
     src = ctx.job.read_json("source.json")
-    vertical = src["height"] >= src["width"] * 1.7
     audio_rms = wav.rms(r.start, r.end) if wav else None
+    render_reasons: set[str] = set()
+    framing = None
+    if _is_vertical(src):
+        crop_ok = True
+    elif crop is None:
+        crop_ok = None
+        render_reasons.add("center crop on wide source: check framing")
+    else:
+        framing = crop[0].metrics
+        inside = framing.get("face_in_frame")
+        if inside is None:
+            crop_ok = None
+            render_reasons.add("no faces found: check framing")
+        else:
+            crop_ok = inside >= ctx.cfg.reframe.min_face_in_frame
+            if not crop_ok:
+                render_reasons.add(f"no face fully in frame in {1 - inside:.0%} of frames with faces")
     tech = {
-        "crop_ok": True if vertical else None,  # center crop on wide input is not verified until M3
+        "crop_ok": crop_ok,
+        "framing": framing,
         "captions_ok": None,
         "audio_ok": None if audio_rms is None else audio_rms > 0.003,
         "render_seconds": round(time.monotonic() - t0, 2),
@@ -290,15 +410,15 @@ def render_one(ctx: Ctx, r: ClipRecord, fonts: Path, wav: Optional[media.Wav]) -
         lang = ctx.transcript().language
         rtl_font = (fonts / "NotoSansArabic-Bold.ttf").exists() or bool(ctx.cfg.captions.fonts_dir)
         tech["captions_ok"] = (not is_rtl(lang)) or rtl_font
-    r.technical = tech
-    reasons = set(r.review_reasons)
-    if tech["crop_ok"] is None:
-        reasons.add("center crop on wide source: check framing")
     if tech["audio_ok"] is False:
-        reasons.add("audio nearly silent")
+        render_reasons.add("audio nearly silent")
     if tech["captions_ok"] is False:
-        reasons.add("no font for this script")
-    r.review_reasons = sorted(reasons)
+        render_reasons.add("no font for this script")
+    # Replace (not pile up) the reasons an earlier render added; keep selection's own reasons.
+    previous = set(r.technical.get("review_reasons") or []) | {"center crop on wide source: check framing"}
+    tech["review_reasons"] = sorted(render_reasons)
+    r.technical = tech
+    r.review_reasons = sorted((set(r.review_reasons) - previous) | render_reasons)
     r.needs_review = bool(r.review_reasons)
 
 
@@ -336,7 +456,8 @@ def st_metadata(ctx: Ctx) -> None:
         if len(tags) < 3:
             r.notes.append("fewer than 3 tags from the judge")
         clips.append({
-            "rank": r.rank, "id": r.id, "file": r.files.get("video"), "start": r.start, "end": r.end,
+            "rank": r.rank, "id": r.id, "source": r.pass1.get("source", "llm"), "file": r.files.get("video"), "start": r.start, "end": r.end,
+            "segments": [{"start": g["start"], "end": g["end"]} for g in r.segments],
             "duration": r.duration, "title": _truncate(r.title, 100), "description": _truncate(r.description, 5000),
             "tags": tags[:5], "hook_text": hook, "hook_line": r.pass1.get("hook_line"), "rationale": r.rationale,
             "content_type": r.content_type, "scores": r.scores, "editorial": r.editorial,
@@ -366,7 +487,7 @@ def st_report(ctx: Ctx) -> None:
 
 STAGE_FUNCS: dict[str, Callable[[Ctx], None]] = {
     "ingest": st_ingest, "transcribe": st_transcribe, "quality": st_quality, "candidates": st_candidates,
-    "judge": st_judge, "snap": st_snap, "captions": st_captions, "render": st_render, "metadata": st_metadata,
+    "judge": st_judge, "snap": st_snap, "reframe": st_reframe, "captions": st_captions, "render": st_render, "metadata": st_metadata,
     "report": st_report,
 }
 
@@ -385,10 +506,12 @@ def run_job(
     progress: Progress = _print_progress,
     llm_backend=None,
     transcriber=None,
+    face_detector=None,
 ) -> dict:
     """Run stages in order, skipping ones already done. A stage that runs forces all later ones."""
     stop_at, from_stage, only = resolve_stage(stop_at), resolve_stage(from_stage), resolve_stage(only)
-    ctx = Ctx(job, cfg, db, progress, llm_backend=llm_backend, transcriber=transcriber)
+    ctx = Ctx(job, cfg, db, progress, llm_backend=llm_backend, transcriber=transcriber,
+              face_detector=face_detector)
     job.state["config"] = cfg.model_dump(exclude={"home"})
     job.save()
     rerun = False
@@ -426,6 +549,31 @@ def run_job(
     finished = all(job.stage_done(s) for s in STAGES)
     db.set_job_status(job.id, "done" if finished else f"stopped:{stop_at or only}")
     return job.state
+
+
+def apply_picks(job: Job, cfg: Config, db: DB, picks_path: Path, progress: Progress = _print_progress,
+                face_detector=None) -> dict:
+    """Use hand-picked spans (picks.py) as the selection, then cut, crop, caption and report as usual."""
+    import shutil
+
+    from .picks import load_picks, picks_to_records
+
+    if not job.path("transcript.json").is_file():
+        raise PipelineError(f"{job.id} has no transcript yet; run: clipper run VIDEO --i-own-rights --stop-at transcript")
+    tr = Transcript.model_validate(job.read_json("transcript.json"))
+    try:
+        records = picks_to_records(tr, load_picks(picks_path), picks_path.name)
+    except ValueError as e:
+        raise PipelineError(str(e)) from e
+    shutil.copyfile(picks_path, job.path("picks.json"))
+    blob = {"records": [r.model_dump() for r in records], "invalid": [], "source": "manual"}
+    job.write_json("candidates.json", blob)
+    job.write_json("judged.json", blob)
+    job.state["selection_source"] = f"hand-picked ({picks_path.name})"
+    for st in ("candidates", "judge"):
+        job.mark(st, "done", 0.0)
+    progress("picks", "info", f"{len(records)} hand-picked clips from {picks_path.name}")
+    return run_job(job, cfg, db, from_stage="snap", progress=progress, face_detector=face_detector)
 
 
 def rerender_clip(job: Job, cfg: Config, db: DB, rank: int, from_json: bool = True) -> Path:

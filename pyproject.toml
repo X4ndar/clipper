@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==9.2.0"]
+# Face-following crop (M3). Without it, clips use a center crop.
+reframe = ["mediapipe==1.2.2"]
 
 [project.scripts]
 clipper = "clipper.cli:app"

@@ -53,5 +53,5 @@ def test_config_example_matches_defaults(tmp_path):
     from clipper.config import Config
 
     root = Path(__file__).resolve().parents[1]
-    data = yaml.safe_load((root / "config.example.yaml").read_text())
+    data = yaml.safe_load((root / "config.example.yaml").read_text(encoding="utf-8"))
     assert data == Config(home="/x").model_dump(exclude={"home"}), "run scripts/gen_config_example.py"

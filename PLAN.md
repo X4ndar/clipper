@@ -8,10 +8,10 @@ stage can be re-run alone. SQLite (`$CLIPPER_HOME/clipper.db`) holds job history
 every LLM call (prompt version, model, params, output, usage, cost), ASR usage and eval runs.
 
 ```
-ingest -> transcribe -> quality -> candidates -> judge -> snap -> captions -> render -> metadata -> report
-          (cached by    (blocks    (pass 1,      (pass 2,  (word    (ASS per   (ffmpeg   (title,     (HTML,
-           audio hash)   before     cheap         strong    bounds,  clip +     9:16,     tags,       all
-                         LLM $)     model)        model)    RMS)     hook)      burn-in)  hook)       candidates)
+ingest -> transcribe -> quality -> candidates -> judge -> snap -> reframe -> captions -> render -> metadata -> report
+          (cached by    (blocks    (pass 1,      (pass 2,  (word    (faces,    (ASS per   (ffmpeg   (title,     (HTML,
+           audio hash)   before     cheap         strong    bounds,  cuts,      clip +     9:16,     tags,       all
+                         LLM $)     model)        model)    RMS)     crop path) hook)      burn-in)  hook)       candidates)
 ```
 
 Backends sit behind small interfaces so they can be swapped and tested offline:
@@ -37,7 +37,8 @@ src/clipper/
   select.py         pass 1 candidates, pass 2 judging, gates, weights, dedupe, final pick
   boundaries.py     word-range mapping, clause-offset validation, filler drop, snapping
   captions.py       caption layout, ASS generation (word highlight / karaoke), hook overlay
-  render.py         ffmpeg cut, center crop, fades, burn-in, single-frame preview
+  reframe.py        shot cuts, face detection (MediaPipe), smoothed crop path, framing metrics
+  render.py         ffmpeg cut, fixed or moving crop, fades, burn-in, single-frame preview
   report.py         HTML review report
   evaluation.py     gold set format, label sheet, precision@k and other metrics
 tests/              unit tests + integration test on a generated sample video
@@ -52,7 +53,9 @@ quality gate, pass 1 + pass 2 with gates and dedupe, boundary snapping, center-c
 review report, eval harness (gold format, label sheet, precision@k, run log), AGENTS.md.
 M2 (this delivery, basic): word-highlight ASS captions burned in, hook overlay, editable captions
 JSON + re-render, single-frame style preview, RTL font.
-M3: reframing (sampled face detection, then active speaker, then layouts).
+M3: reframing. Done: sampled face detection (MediaPipe full-range, CPU), shot-cut detection, a
+hold-still / smooth-pan crop path per shot, framing metrics vs center crop. Next: active speaker
+(mouth motion against speech, plus diarization labels when on), then two-person layouts.
 M4: audio signals, visual check, pairwise ranking, A/B, batch mode, job history UI.
 M5: YouTube upload (private, human approval), then performance loop.
 M6: FastAPI + web UI + SSE progress, API keys, MCP server, SKILL.md, packaging.

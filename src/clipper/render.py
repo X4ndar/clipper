@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +49,17 @@ def _filter_path(p: Path) -> str:
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'").replace(",", "\\,")
 
 
+@dataclass
+class DynamicCrop:
+    """A crop window whose x moves over time, driven by an ffmpeg sendcmd file (see reframe.py)."""
+
+    w: int
+    h: int
+    x0: int
+    y: int
+    cmd_path: Path
+
+
 def crop_filter(width: int, height: int) -> str:
     # Center crop to the target aspect, then scale. Works for landscape, square and portrait input.
     ar = f"{width}/{height}"
@@ -57,8 +69,16 @@ def crop_filter(width: int, height: int) -> str:
     )
 
 
-def video_filter(rcfg, ass_path: Optional[Path], fonts_dir: Optional[Path]) -> str:
-    vf = crop_filter(rcfg.width, rcfg.height)
+def dynamic_crop_filter(c: DynamicCrop, width: int, height: int) -> str:
+    return (
+        f"sendcmd=f='{_filter_path(c.cmd_path)}',crop@rf=w={c.w}:h={c.h}:x={c.x0}:y={c.y},"
+        f"scale={width}:{height}:flags=lanczos,setsar=1"
+    )
+
+
+def video_filter(rcfg, ass_path: Optional[Path], fonts_dir: Optional[Path],
+                 crop: Optional[DynamicCrop] = None) -> str:
+    vf = crop_filter(rcfg.width, rcfg.height) if crop is None else dynamic_crop_filter(crop, rcfg.width, rcfg.height)
     if ass_path is not None:
         vf += f",ass='{_filter_path(ass_path)}'"
         if fonts_dir is not None:
@@ -66,29 +86,43 @@ def video_filter(rcfg, ass_path: Optional[Path], fonts_dir: Optional[Path]) -> s
     return vf
 
 
+def _afade(dur: float, fade: float) -> str:
+    return f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={max(0.0, dur - fade):.3f}:d={fade:.3f}"
+
+
 def render_clip(src: Path, out: Path, start: float, end: float, rcfg, fade_ms: float,
-                ass_path: Optional[Path], fonts_dir: Optional[Path]) -> None:
-    dur = max(0.1, end - start)
+                ass_path: Optional[Path], fonts_dir: Optional[Path], crop: Optional[DynamicCrop] = None,
+                segments: Optional[list[tuple[float, float]]] = None) -> None:
+    """Render one clip. With `segments` (several (start, end) source spans), join them with jump cuts
+    in the given order; each piece gets its own short audio fade so the joins do not click."""
     fade = max(0.0, fade_ms / 1000)
-    af = f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={max(0.0, dur - fade):.3f}:d={fade:.3f}"
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp.mp4")
-    cmd = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{dur:.3f}",
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", video_filter(rcfg, ass_path, fonts_dir),
-        "-af", af,
+    encode = [
         "-c:v", rcfg.video_codec, "-preset", rcfg.preset, "-crf", str(rcfg.crf), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", rcfg.audio_bitrate, "-ar", "48000",
         "-threads", str(rcfg.threads), "-movflags", "+faststart", str(tmp),
     ]
-    run(cmd)
+    head = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    vf = video_filter(rcfg, ass_path, fonts_dir, crop)
+    if segments and len(segments) > 1:
+        inputs, fc = [], []
+        for i, (a, b) in enumerate(segments):
+            d = max(0.1, b - a)
+            inputs += ["-ss", f"{a:.3f}", "-t", f"{d:.3f}", "-i", str(src)]
+            fc.append(f"[{i}:v:0]setpts=PTS-STARTPTS[v{i}];[{i}:a:0]asetpts=PTS-STARTPTS,{_afade(d, fade)}[a{i}]")
+        joined = "".join(f"[v{i}][a{i}]" for i in range(len(segments)))
+        fc.append(f"{joined}concat=n={len(segments)}:v=1:a=1[vc][ac];[vc]{vf}[vout]")
+        run(head + inputs + ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", "[ac]"] + encode)
+    else:
+        dur = max(0.1, end - start)
+        run(head + ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{dur:.3f}",
+                    "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf, "-af", _afade(dur, fade)] + encode)
     tmp.replace(out)
 
 
 def render_frame(src: Path, out: Path, clip_start: float, at: float, rcfg, ass_path: Optional[Path],
-                 fonts_dir: Optional[Path]) -> None:
+                 fonts_dir: Optional[Path], crop: Optional[DynamicCrop] = None) -> None:
     """One PNG frame at `at` seconds into the clip, with captions, to tune a style in seconds.
 
     Seeks to just before the frame and lets the subtitle filter see the correct timestamp.
@@ -99,7 +133,7 @@ def render_frame(src: Path, out: Path, clip_start: float, at: float, rcfg, ass_p
     # then keep the first frame at or after `at`.
     vf = (
         f"setpts=PTS-STARTPTS+{at - pre:.3f}/TB,"
-        + video_filter(rcfg, ass_path, fonts_dir)
+        + video_filter(rcfg, ass_path, fonts_dir, crop)
         + f",select=gte(t\\,{at:.3f})"
     )
     run([

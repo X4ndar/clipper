@@ -121,12 +121,30 @@ class SnapConfig(BaseModel):
 class RenderConfig(BaseModel):
     width: int = 1080
     height: int = 1920
-    reframe: Literal["center"] = "center"
+    # face: follow faces (needs the `reframe` extra; falls back to center with a warning). center: fixed crop.
+    reframe: Literal["face", "center"] = "face"
     video_codec: str = "libx264"
     preset: str = "veryfast"
     crf: int = 20
     audio_bitrate: str = "160k"
     threads: int = 0
+
+
+class ReframeConfig(BaseModel):
+    sample_fps: float = 4.0  # face detection samples per second
+    analysis_width: int = 1280  # frames are downscaled to this width for detection
+    min_confidence: float = 0.5
+    min_face_rel_size: float = 0.5  # ignore faces narrower than this share of the largest one
+    dead_zone: float = 0.15  # share of the crop width the subject may drift before the crop moves
+    smooth_s: float = 1.0  # pan smoothing window
+    cut_threshold: float = 0.12  # mean frame difference that marks a shot cut
+    min_face_in_frame: float = 0.8  # below this share of frames, flag the clip for review
+    model_url: str = (
+        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+        "blaze_face_full_range/float16/1/blaze_face_full_range.tflite"
+    )
+    model_sha256: str = "3698b18f063835bc609069ef052228fbe86d9c9a6dc8dcb7c7c2d69aed2b181b"
+    model_path: Optional[str] = None  # use a local copy instead of downloading
 
 
 class CaptionsConfig(BaseModel):
@@ -174,6 +192,7 @@ class Config(BaseModel):
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
     snap: SnapConfig = Field(default_factory=SnapConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
+    reframe: ReframeConfig = Field(default_factory=ReframeConfig)
     captions: CaptionsConfig = Field(default_factory=CaptionsConfig)
     hook: HookConfig = Field(default_factory=HookConfig)
 

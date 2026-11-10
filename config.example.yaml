@@ -105,12 +105,24 @@ snap:
 render:
   width: 1080
   height: 1920
-  reframe: center
+  reframe: face
   video_codec: libx264
   preset: veryfast
   crf: 20
   audio_bitrate: 160k
   threads: 0
+reframe:
+  sample_fps: 4.0
+  analysis_width: 1280
+  min_confidence: 0.5
+  min_face_rel_size: 0.5
+  dead_zone: 0.15
+  smooth_s: 1.0
+  cut_threshold: 0.12
+  min_face_in_frame: 0.8
+  model_url: https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite
+  model_sha256: 3698b18f063835bc609069ef052228fbe86d9c9a6dc8dcb7c7c2d69aed2b181b
+  model_path: null
 captions:
   enabled: true
   mode: word

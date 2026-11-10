@@ -1,7 +1,7 @@
 .PHONY: install test test-unit sample lint lock
 
 install:
-	uv sync --frozen --extra dev
+	uv sync --frozen --extra dev --extra reframe
 
 test:
 	uv run --frozen pytest -q

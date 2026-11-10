@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import html
-import json
 from pathlib import Path
+from typing import Optional
 
 from .jobs import Job
 from .transcript import fmt_ts
@@ -58,22 +58,39 @@ def _scores(scores: dict) -> str:
     return f"<div class='scores'>{''.join(rows)}</div>"
 
 
+def _framing(m: Optional[dict]) -> str:
+    """One line on the face-following crop: how often a face is fully visible, vs a plain center crop."""
+    if not m:
+        return ""
+    if m.get("face_in_frame") is None:
+        return "<div class='muted'>framing: no faces found; crop holds the center</div>"
+
+    def pct(k: str) -> str:
+        v = m.get(k)
+        return "–" if v is None else f"{v:.0%}"
+
+    return (f"<div class='muted'>framing: a face fully in frame {pct('face_in_frame')} "
+            f"(center crop {pct('face_in_frame_center_crop')}), a face sliced by the edge {pct('face_cut')} "
+            f"(center crop {pct('face_cut_center_crop')}); faces seen in {pct('face_share')} of frames, "
+            f"{m.get('shots')} shots</div>")
+
+
 def write_report(job: Job, cfg) -> Path:
     sel_path = job.path("selection.json")
-    records = json.loads(sel_path.read_text())["records"] if sel_path.is_file() else []
+    records = job.read_json("selection.json")["records"] if sel_path.is_file() else []
     if not records and job.path("judged.json").is_file():
-        records = json.loads(job.path("judged.json").read_text())["records"]
+        records = job.read_json("judged.json")["records"]
     if not records and job.path("candidates.json").is_file():
-        records = json.loads(job.path("candidates.json").read_text())["records"]
-    invalid = json.loads(job.path("candidates.json").read_text()).get("invalid", []) \
+        records = job.read_json("candidates.json")["records"]
+    invalid = job.read_json("candidates.json").get("invalid", []) \
         if job.path("candidates.json").is_file() else []
-    clips = json.loads(job.path("clips.json").read_text())["clips"] if job.path("clips.json").is_file() else []
+    clips = job.read_json("clips.json")["clips"] if job.path("clips.json").is_file() else []
     st = job.state.get("stats", {})
     spec = job.state.get("spec", {})
     warnings = job.state.get("warnings", [])
     sentences = []
     if job.path("transcript.json").is_file():
-        sentences = json.loads(job.path("transcript.json").read_text()).get("sentences", [])
+        sentences = job.read_json("transcript.json").get("sentences", [])
 
     def cost(k):
         v = st.get(k)
@@ -94,8 +111,11 @@ def write_report(job: Job, cfg) -> Path:
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>Clip review</title><style>{CSS}</style></head><body><main>",
         f"<h1>Clip review</h1><div class='muted'>{e(Path(spec.get('video', '')).name)} · job <code>{e(job.id)}</code>"
-        f" · {e(spec.get('content_type'))} · prompts {e(cfg.llm.candidate_prompt)}/{e(cfg.llm.judge_prompt)}"
-        f" · models {e(cfg.llm.candidate_model)}/{e(cfg.llm.judge_model)}</div>",
+        f" · {e(spec.get('content_type'))} · "
+        + (f"selection: <b>{e(job.state['selection_source'])}</b>" if job.state.get("selection_source") else
+           f"prompts {e(cfg.llm.candidate_prompt)}/{e(cfg.llm.judge_prompt)}"
+           f" · models {e(cfg.llm.candidate_model)}/{e(cfg.llm.judge_model)}")
+        + "</div>",
         "<div class='stats'>" + "".join(f"<div class='stat'><span class='muted'>{e(a)}</span><b>{e(b)}</b></div>"
                                         for a, b in stats) + "</div>",
     ]
@@ -115,17 +135,22 @@ def write_report(job: Job, cfg) -> Path:
         else:
             flags.append("<span class='flag ok'>no review flags</span>")
         conf = c.get("confidence", {})
-        video = f"<video controls preload='metadata' src='{e(c['file'])}'></video>" if c.get("file") else ""
+        video = f"<video controls preload='none' src='{e(c['file'])}'></video>" if c.get("file") else ""
         parts.append(
             "<div class='card'><div>" + video + "</div><div>"
             f"<div class='muted'>#{c['rank']} · {fmt_ts(c['start'])}–{fmt_ts(c['end'])} · {c['duration']:.1f}s · "
-            f"{e(c.get('content_type'))} · editorial <b>{c['editorial']:.2f}</b></div>"
+            + (f"{len(c['segments'])} pieces (" + ", ".join(f"{fmt_ts(g['start'])}–{fmt_ts(g['end'])}"
+                                                    for g in c['segments']) + ") · " if c.get("segments") else "")
+            + f"{e(c.get('content_type'))} · "
+            + ("<b>hand-picked</b>" if c.get("source") == "manual" else f"editorial <b>{c['editorial']:.2f}</b>")
+            + "</div>"
             f"<div class='title'>{e(c.get('title'))}</div>"
             + (f"<div class='hook'>Hook overlay: “{e(c['hook_text'])}”</div>" if c.get("hook_text") else "")
             + f"<div>{''.join(flags)}</div>{_scores(c.get('scores', {}))}"
             f"<div class='muted'>confidence: judge {e(conf.get('llm'))}, ASR {e(conf.get('asr'))}, "
             f"boundaries {'ok' if conf.get('boundary_ok') else 'check'}</div>"
-            f"<p>{e(c.get('rationale'))}</p>"
+            + _framing(c.get("technical", {}).get("framing"))
+            + f"<p>{e(c.get('rationale'))}</p>"
             f"<div class='muted'>{e(c.get('description'))}<br>tags: {e(', '.join(c.get('tags', [])))}</div>"
             f"<details><summary>Transcript</summary><div class='quote'>{e(c.get('text'))}</div></details>"
             + (f"<details><summary>Notes</summary><ul>{''.join(f'<li>{e(n)}</li>' for n in c.get('notes', []))}"

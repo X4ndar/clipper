@@ -35,6 +35,29 @@ pluggy, iniconfig, rich, truststore, typing-inspection (MIT); httpcore, httpcore
 (Apache-2.0); shellingham (ISC); sniffio (MIT OR Apache-2.0); typing_extensions (PSF-2.0);
 certifi (MPL-2.0, used unmodified).
 
+### Optional extra `reframe` (face-following crop, checked 2026-11-07)
+
+| Package | Version | License |
+|---|---|---|
+| mediapipe | 1.2.2 | Apache-2.0 |
+| opencv-contrib-python | 5.0.0.93 | Apache-2.0 |
+| matplotlib | 3.11.2 | Matplotlib License (PSF-based) |
+| absl-py / flatbuffers | 2.5.1 / 25.12.19 | Apache-2.0 |
+| sounddevice | 0.5.6 | MIT |
+| pillow | 13.0.0 | MIT-CMU |
+
+Transitive: cffi (MIT-0); fonttools, pyparsing (MIT); pycparser, contourpy, python-dateutil
+(BSD-3-Clause); cycler, kiwisolver (BSD); tzdata (Apache-2.0). MediaPipe imports OpenCV,
+matplotlib and sounddevice at load time; only its face detector is used.
+
+## Downloaded model
+
+| File | Source | License |
+|---|---|---|
+| `blaze_face_full_range.tflite` (BlazeFace full-range, float16 v1) | storage.googleapis.com/mediapipe-models, pinned by SHA-256 in `reframe.model_sha256` | Apache-2.0 (MediaPipe model card) |
+
+Downloaded on first use to `$CLIPPER_HOME/models/`, not bundled in the repo.
+
 ## External programs
 
 ffmpeg/ffprobe are called as separate programs, not linked. Distribution builds (Debian, Ubuntu)

@@ -64,13 +64,13 @@ def parse_time(s: str) -> float:
 def _records(job: Job) -> list[dict]:
     for name in ("selection.json", "judged.json", "candidates.json"):
         if job.path(name).is_file():
-            return json.loads(job.path(name).read_text())["records"]
+            return job.read_json(name)["records"]
     raise FileNotFoundError(f"{job.id}: no candidates yet; run at least to --stop-at candidates")
 
 
 def write_label_sheet(job: Job, out: Path, blank_rows: int = 10) -> Path:
     """CSV with every candidate the system considered, plus blank rows for clips a human would pick."""
-    tr = json.loads(job.path("transcript.json").read_text())
+    tr = job.read_json("transcript.json")
     sents = tr["sentences"]
     rows = []
     for r in sorted(_records(job), key=lambda r: sents[r["start_sentence_id"]]["start"]):

@@ -6,7 +6,7 @@ Guide for coding agents working in this repo. Keep it current when you change la
 
 A self-hosted tool that turns a long video the user owns into short vertical clips. One Python
 package, SQLite for state, ffmpeg for media. Transcript-first: ASR -> two LLM passes -> boundary
-snapping -> 9:16 render with burned-in captions -> HTML review report. See `PLAN.md`.
+snapping -> face-following 9:16 crop -> render with burned-in captions -> HTML review report. See `PLAN.md`.
 
 ## Layout
 
@@ -24,10 +24,12 @@ src/clipper/
                   prompts/<name>_vN.md (versioned; never edit a version in place, add v2)
   select.py       pass 1, pass 2, hard gates, weights, dedupe, final pick
   boundaries.py   sentence->word mapping, clause offsets, filler drop, quiet-frame snapping
+  reframe.py      shot cuts, MediaPipe face detection, crop path (sendcmd), framing metrics
   captions.py     ASS generation (word highlight, karaoke, plain) + hook overlay
-  render.py       ffmpeg cut/crop/burn-in, single-frame preview, font folder merge
+  render.py       ffmpeg cut/crop (fixed or moving)/burn-in, single-frame preview, font folder merge
   report.py       report.html
   evaluation.py   gold format, label sheet, metrics
+  picks.py        hand-picked clips (JSON) -> accepted candidates; `clipper picks JOB FILE`
 scripts/make_sample.py   synthetic two-speaker sample (flite TTS + test pattern)
 tests/                   pytest; test_integration.py needs ffmpeg with libass and flite
 assets/fonts/            OFL fonts only; record any new asset in LICENSES.md
@@ -36,7 +38,7 @@ assets/fonts/            OFL fonts only; record any new asset in LICENSES.md
 ## Commands
 
 ```
-uv sync --frozen --extra dev        # install (or: make install)
+uv sync --frozen --extra dev --extra reframe   # install (or: make install); reframe = MediaPipe
 make test                           # all tests (unit + integration), about 1 minute
 make test-unit                      # skip the ffmpeg integration tests
 uv run clipper run VIDEO --i-own-rights --set transcribe.backend=fixture --set llm.backend=fake
@@ -57,6 +59,9 @@ make sample                         # writes sample/podcast.mp4 + sample/podcast
 - No secrets in code or config files. Keys come from env / `.env`.
 - Pin dependency versions; regenerate `uv.lock` with `uv lock`; check licenses before adding one.
 - Do not copy code, prompts or UI from AGPL projects (SupoClip).
+- Face detection goes through the `FaceDetector` interface in reframe.py; tests inject a fake one
+  (`run_job(..., face_detector=...)`). Integration tests pin `render.reframe=center` unless they test reframing.
+- Windows: no `make`; run the uv commands above. Read and write text files with `encoding="utf-8"`.
 - Current Claude models reject `temperature`; use `output_config.effort`.
 - Change prompts by adding a new version file and pointing `llm.candidate_prompt` / `llm.judge_prompt`
   at it, then compare on the gold set with `clipper eval run` / `clipper eval summary`.
